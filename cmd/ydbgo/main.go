@@ -1,0 +1,105 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"time"
+
+	"ydbgo/internal/server"
+)
+
+const usage = `ydbgo — single-binary distributed SQL database (YDB-inspired)
+
+Usage:
+  ydbgo serve [-addr host:port] [-data DIR]                 start the database server
+  ydbgo serve -raft-addr R:PORT [-node-id ID]               start as a cluster node
+           [-bootstrap] [-join HOST:PORT] [-rf N] [-shard-size BYTES]
+           [-split-check DURATION] [-recovery-check DURATION] [-addr ...]
+  ydbgo run [-addr host:port] SQL...                        execute SQL against a server
+  ydbgo repl [-addr host:port]                              interactive shell
+  ydbgo bench -addr host:port [-n N] [-rows R] [-c C]       benchmark concurrent inserts
+  ydbgo run -addr host:port @FILE.sql                       run statements from a file
+
+Examples:
+  ydbgo serve -addr :2135 -data ./data
+  ydbgo serve -addr :2135 -data ./n1 -raft-addr 127.0.0.1:7001 -node-id n1 -bootstrap
+  ydbgo serve -addr :2136 -data ./n2 -raft-addr 127.0.0.1:7002 -node-id n2 -join 127.0.0.1:2135
+  ydbgo run -addr :2135 "CREATE TABLE users (id int64 primary key, v string)"
+  ydbgo run -addr :2135 "ADMIN SHARDS users"
+  ydbgo run -addr :2135 "ADMIN SPLIT TABLE users AT 500"
+  ydbgo repl
+`
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Print(usage)
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "serve", "server":
+		runServe(os.Args[2:])
+	case "run", "exec":
+		runClient(os.Args[2:])
+	case "bench":
+		runBench(os.Args[2:])
+	case "repl", "shell":
+		runRepl(os.Args[2:])
+	case "-h", "--help", "help":
+		fmt.Print(usage)
+	default:
+		fmt.Print(usage)
+		os.Exit(2)
+	}
+}
+
+func runServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", ":2135", "listen address")
+	data := fs.String("data", "./ydbgo-data", "data directory")
+	id := fs.String("node-id", "", "raft node id (defaults to raft-addr)")
+	raftAddr := fs.String("raft-addr", "", "raft listen address; empty disables clustering")
+	bootstrap := fs.Bool("bootstrap", false, "bootstrap a new single-node cluster")
+	join := fs.String("join", "", "existing node to join (host:port of a live node)")
+	rf := fs.Int("rf", 0, "replication factor for data shards (0 = all nodes)")
+	shardSize := fs.Uint64("shard-size", 0, "auto-split threshold in bytes (0 = disabled)")
+	splitTick := fs.Duration("split-check", 5*time.Second, "auto-split check interval")
+	recoveryTick := fs.Duration("recovery-check", 0, "replica-heal check interval (0 = disabled)")
+	fs.Parse(args)
+	if *raftAddr == "" {
+		if err := server.RunServer(*addr, *data); err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if err := server.RunClusterServer(*addr, *data, *id, *raftAddr, *bootstrap, *join, *rf, *shardSize, *splitTick, *recoveryTick); err != nil {
+		fmt.Fprintln(os.Stderr, "serve:", err)
+		os.Exit(1)
+	}
+}
+
+func runClient(args []string) {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:2135", "server address")
+	fs.Parse(args)
+	rest := fs.Args()
+	if len(rest) == 0 {
+		fmt.Fprintln(os.Stderr, "run: no SQL given")
+		os.Exit(2)
+	}
+	if err := server.RunClient(*addr, rest); err != nil {
+		fmt.Fprintln(os.Stderr, "run:", err)
+		os.Exit(1)
+	}
+}
+
+func runRepl(args []string) {
+	fs := flag.NewFlagSet("repl", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:2135", "server address")
+	fs.Parse(args)
+	if err := server.RunClient(*addr, nil); err != nil {
+		fmt.Fprintln(os.Stderr, "repl:", err)
+		os.Exit(1)
+	}
+}

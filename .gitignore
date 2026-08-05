@@ -1,0 +1,17 @@
+# binaries
+/ydbgo
+/dist/
+
+# data directories (standalone + per-node n1..nN)
+/data/
+/data*/
+/n*/
+
+# bbolt + raft state (already under data dirs, kept here for safety)
+*.bbolt
+/raft/
+/stable
+
+# OS / editor
+.DS_Store
+*.swp
