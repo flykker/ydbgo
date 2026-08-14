@@ -125,6 +125,22 @@ func printResponse(tab *tabwriter.Writer, resp *proto.Response) {
 			fmt.Fprintln(tab)
 		}
 		fmt.Fprintf(tab, "(%d rows)\t\n", len(r.Rows))
+	case "kv_get", "kv_scan":
+		if len(r.Columns) == 0 {
+			fmt.Println("OK")
+			return
+		}
+		for _, c := range r.Columns {
+			fmt.Fprintf(tab, "%s\t", c)
+		}
+		fmt.Fprintln(tab)
+		for _, row := range r.Rows {
+			for _, v := range row {
+				fmt.Fprintf(tab, "%s\t", v)
+			}
+			fmt.Fprintln(tab)
+		}
+		fmt.Fprintf(tab, "(%d rows)\t\n", len(r.Rows))
 	case "admin":
 		if r.Note != "" {
 			fmt.Println(r.Note)

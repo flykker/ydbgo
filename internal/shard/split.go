@@ -123,7 +123,7 @@ func (m *Manager) splitPointFor(spec *ShardSpec) (string, bool) {
 	if ts == nil {
 		return "", false
 	}
-	rows, err := m.scanShard(spec)
+	rows, err := m.scanShard(spec, "SELECT * FROM "+spec.Table)
 	if err != nil {
 		return "", false
 	}

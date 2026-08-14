@@ -95,18 +95,14 @@ func rowKeyString(r Row) string {
 	return strings.Join(parts, "\x00")
 }
 
-func sortRows(rows []Row, order []*OrderItem, schema *TableSchema) {
-	sort.SliceStable(rows, func(i, j int) bool {
+// sortContexts sorts full-width row contexts by the ORDER BY expressions. It is
+// applied before projection because projected rows carry only the selected
+// columns and cannot be compared by unselected sort keys.
+func sortContexts(contexts []map[string]Value, order []*OrderItem) {
+	sort.SliceStable(contexts, func(i, j int) bool {
 		for _, o := range order {
-			var ci, cj map[string]Value
-			if schema == nil {
-				ci, cj = map[string]Value{}, map[string]Value{}
-			} else {
-				ci = rowContext(schema, rows[i])
-				cj = rowContext(schema, rows[j])
-			}
-			vi, err1 := Eval(o.Expr, ci)
-			vj, err2 := Eval(o.Expr, cj)
+			vi, err1 := Eval(o.Expr, contexts[i])
+			vj, err2 := Eval(o.Expr, contexts[j])
 			if err1 != nil || err2 != nil {
 				continue
 			}

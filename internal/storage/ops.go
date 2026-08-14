@@ -2,6 +2,8 @@ package storage
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -24,21 +26,32 @@ func (e *Engine) CreateTable(s *sqlx.TableSchema) error {
 			}
 		}
 	}
-	return e.createTableInt(s.Name, cols, pk)
+	return e.createTableEngine(s.Name, cols, pk, engineOf(s.Engine), s.Retention)
 }
 
 // createTableInt is raw storage creation.
 func (e *Engine) createTableInt(name string, cols []colInfo, pk []int) error {
+	return e.createTableEngine(name, cols, pk, "", 0)
+}
+
+func (e *Engine) createTableEngine(name string, cols []colInfo, pk []int, engine string, retention time.Duration) error {
 	unlock := e.writeLock()
 	defer unlock()
 	if _, ok := e.tables[name]; ok {
 		return &existsError{name: name}
 	}
+	if engine != "" && engine != "TABLE" {
+		if _, err := e.engineStore(engine); err != nil {
+			return err
+		}
+	}
 	t := &table{
-		name:    name,
-		cols:    cols,
-		pk:      pk,
-		indexes: map[string]*index{},
+		name:      name,
+		cols:      cols,
+		pk:        pk,
+		indexes:   map[string]*index{},
+		engine:    engine,
+		retention: retention,
 	}
 	def := e.encodeCreateTable(t)
 	err := e.write(func(tx storeTx) error {
@@ -51,15 +64,28 @@ func (e *Engine) createTableInt(name string, cols []colInfo, pk []int) error {
 	return nil
 }
 
-// DropTable removes a schema and its rows.
+// DropTable removes a schema (from the default store) and a table's rows
+// (from the engine's own store).
 func (e *Engine) DropTable(name string) error {
 	unlock := e.writeLock()
 	defer unlock()
-	if _, ok := e.tables[name]; !ok {
+	t, ok := e.tables[name]
+	if !ok {
 		return notFoundError{table: name}
 	}
-	if err := e.write(func(tx storeTx) error {
-		return tx.dropTable(name)
+	rowStore := e.store(t.engine)
+	if err := e.writeTo(e.store(""), func(tx storeTx) error {
+		return tx.schemaDelete(name)
+	}); err != nil {
+		return err
+	}
+	if err := e.writeTo(rowStore, func(tx storeTx) error {
+		if kt, ok := tx.(*kvTx); ok {
+			if err := kt.dataDeleteAll(name); err != nil {
+				return err
+			}
+		}
+		return tx.rowDeleteAll(name)
 	}); err != nil {
 		return err
 	}
@@ -75,7 +101,7 @@ func (e *Engine) GetSchema(name string) (*sqlx.TableSchema, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &sqlx.TableSchema{Name: t.name}
+	s := &sqlx.TableSchema{Name: t.name, Engine: t.engine, Retention: t.retention}
 	for i, c := range t.cols {
 		cd := sqlx.ColumnDef{Name: c.name, Type: toSQLType(c.typ), NotNull: c.notNull}
 		for _, p := range t.pk {
@@ -114,7 +140,7 @@ func (e *Engine) Put(name string, vals map[string]sqlValue) error {
 		return err
 	}
 	key := schemaKey(t, vals)
-	return e.write(func(tx storeTx) error {
+	return e.writeTo(e.store(t.engine), func(tx storeTx) error {
 		return tx.rowPut(t.name, []byte(key), encodeRow(vals, t))
 	})
 }
@@ -132,8 +158,9 @@ func (e *Engine) Update(table string, pkValues []sqlx.Value, set map[string]sqlx
 		key[i] = fromSQLValue(v)
 	}
 	pkKey := encodeKey(key)
+	st := e.store(t.engine)
 	var old map[string]sqlValue
-	e.read(func(tx storeTx) error {
+	e.readFrom(st, func(tx storeTx) error {
 		data, err := tx.rowGet(t.name, []byte(pkKey))
 		if err != nil {
 			return err
@@ -151,7 +178,7 @@ func (e *Engine) Update(table string, pkValues []sqlx.Value, set map[string]sqlx
 		old[k] = fromSQLValue(v)
 	}
 	newKey := schemaKey(t, old)
-	return e.write(func(tx storeTx) error {
+	return e.writeTo(st, func(tx storeTx) error {
 		if newKey != pkKey {
 			if err := tx.rowDelete(t.name, []byte(pkKey)); err != nil {
 				return err
@@ -173,9 +200,64 @@ func (e *Engine) Delete(table string, pkValues []sqlx.Value) error {
 	for i, v := range pkValues {
 		key[i] = fromSQLValue(v)
 	}
-	return e.write(func(tx storeTx) error {
+	return e.writeTo(e.store(t.engine), func(tx storeTx) error {
 		return tx.rowDelete(t.name, []byte(encodeKey(key)))
 	})
+}
+
+// DeleteRange implements sqlx.Engine: it removes every CSTORE row whose
+// encoded PK lies inside r (nil bounds = unbounded), deleting the row marker
+// and every column cell of each affected row in one transaction.
+func (e *Engine) DeleteRange(table string, r *sqlx.PKRange) (int64, error) {
+	var affected int64
+	unlock := e.writeLock()
+	err := func() error {
+		defer unlock()
+		t, err := e.getTable(table)
+		if err != nil {
+			return err
+		}
+		if t.engine != "CSTORE" {
+			return fmt.Errorf("range delete requires a CSTORE table")
+		}
+		plLower, plUpper := PKRangeBytes(r)
+		return e.writeTo(e.store(t.engine), func(tx storeTx) error {
+			ct, ok := tx.(*cstoreTx)
+			if !ok {
+				return errors.New("range delete requires the CSTORE store")
+			}
+			return ct.rowDeleteRange(t.name, plLower, plUpper, &affected)
+		})
+	}()
+	if err != nil {
+		return 0, err
+	}
+	// Reclaim space immediately when not inside a raft group-commit batch
+	// (the store commit just happened synchronously): drop superseded versions.
+	if !e.txActive() {
+		if _, cerr := e.Compact(table); cerr != nil {
+			return affected, cerr
+		}
+	}
+	return affected, nil
+}
+
+// Compact physically removes superseded KV versions of a CSTORE table's
+// store, keeping only the newest version of each key (a no-op for the latest
+// revision). This is the space-reclaim companion to range deletes: retention
+// tombstones plus older live versions are dropped.
+func (e *Engine) Compact(table string) (int64, error) {
+	unlock := e.writeLock()
+	defer unlock()
+	t, err := e.getTable(table)
+	if err != nil {
+		return 0, err
+	}
+	cs, ok := e.store(t.engine).(*cstoreStore)
+	if !ok {
+		return 0, errors.New("compaction requires the CSTORE store")
+	}
+	return cs.st.Compact(cs.st.Latest())
 }
 
 // Scan implements sqlx.Engine.
@@ -191,7 +273,7 @@ func (e *Engine) scanRows(name string) ([]sqlx.Row, error) {
 		return nil, err
 	}
 	var rows []sqlx.Row
-	e.read(func(tx storeTx) error {
+	e.readFrom(e.store(t.engine), func(tx storeTx) error {
 		return tx.rowEach(t.name, func(k, v []byte) error {
 			vals, err := decodeRow(v, t)
 			if err != nil {
@@ -376,3 +458,15 @@ func fromSQLValue(v sqlx.Value) sqlValue {
 type existsError struct{ name string }
 
 func (e *existsError) Error() string { return "table " + e.name + " already exists" }
+
+// engineOf normalizes a storage engine name.
+func engineOf(e string) string {
+	switch e {
+	case "KV":
+		return "KV"
+	case "CSTORE":
+		return "CSTORE"
+	default:
+		return "TABLE"
+	}
+}

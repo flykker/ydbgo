@@ -28,7 +28,7 @@ func RunServer(addr, dir string) error {
 // RunClusterServer starts a sharded cluster node: a meta-group member plus
 // the data shard groups this node hosts.
 func RunClusterServer(addr, dataDir, id, raftAddr string, bootstrap bool, join string,
-	rf int, shardSize uint64, splitTick, recoveryTick time.Duration) error {
+	rf int, shardSize uint64, splitTick, recoveryTick, ttlTick time.Duration) error {
 	if id == "" {
 		id = raftAddr
 	}
@@ -45,6 +45,7 @@ func RunClusterServer(addr, dataDir, id, raftAddr string, bootstrap bool, join s
 		ShardSize:    shardSize,
 		SplitTick:    splitTick,
 		RecoveryTick: recoveryTick,
+		TTLTick:      ttlTick,
 	})
 	if err != nil {
 		return err

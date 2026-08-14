@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"time"
+
 	sqlx "ydbgo/internal/sql"
 )
 
@@ -9,6 +11,7 @@ const (
 	recCreateTable byte = 1
 	recDropTable   byte = 2
 	recMutate      byte = 3
+	recKVData      byte = 4
 )
 
 // marshals a create-table record: table metadata + rows (none at creation).
@@ -16,6 +19,7 @@ func (e *Engine) encodeCreateTable(t *table) []byte {
 	b := newBuilder()
 	b.Byte(recCreateTable)
 	b.Str(t.name)
+	b.Str(t.engine)
 	b.Var(int64(len(t.cols)))
 	for _, c := range t.cols {
 		b.Str(c.name)
@@ -35,6 +39,7 @@ func (e *Engine) encodeCreateTable(t *table) []byte {
 			b.Var(int64(c))
 		}
 	}
+	b.Var(int64(t.retention))
 	return b.Bytes()
 }
 
@@ -43,6 +48,7 @@ func (e *Engine) unmarshalCreateTable(buf []byte) (*table, error) {
 	r.Byte() // recCreateTable
 	t := &table{indexes: map[string]*index{}}
 	t.name = r.Str()
+	t.engine = r.Str()
 	nc := int(r.Var())
 	for i := 0; i < nc; i++ {
 		c := colInfo{}
@@ -64,6 +70,7 @@ func (e *Engine) unmarshalCreateTable(buf []byte) (*table, error) {
 		}
 		t.indexes[ix.name] = ix
 	}
+	t.retention = time.Duration(r.Var())
 	if r.err != nil {
 		return nil, r.err
 	}

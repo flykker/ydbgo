@@ -1,8 +1,11 @@
 package sql
 
 import (
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Parser struct {
@@ -110,7 +113,83 @@ func (p *Parser) parseStatement() (Statement, error) {
 		p.advance()
 		return &RollbackStmt{}, nil
 	}
+	if p.isKeyword("kv") {
+		return p.parseKV()
+	}
 	return nil, fmt.Errorf("unexpected token %q at pos %d", p.peek().text, p.peek().pos)
+}
+
+// parseKV parses the raw byte-KV surface for ENGINE=KV tables:
+//
+//	KV PUT <table> <key> <value>
+//	KV GET <table> <key>
+//	KV DELETE <table> <key>
+//	KV SCAN <table> [<start> <end>]
+//
+// keys/values are string literals and are kept as raw bytes in the statement.
+func (p *Parser) parseKV() (Statement, error) {
+	p.advance() // kv
+	switch {
+	case p.isKeyword("put"):
+		p.advance()
+		table := p.identLower()
+		key, err := p.stringLiteral()
+		if err != nil {
+			return nil, err
+		}
+		value, err := p.stringLiteral()
+		if err != nil {
+			return nil, err
+		}
+		return &KVPutStmt{Table: table, Key: key, Value: value}, nil
+	case p.isKeyword("get"):
+		p.advance()
+		table := p.identLower()
+		key, err := p.stringLiteral()
+		if err != nil {
+			return nil, err
+		}
+		return &KVGetStmt{Table: table, Key: key}, nil
+	case p.isKeyword("delete"):
+		p.advance()
+		table := p.identLower()
+		key, err := p.stringLiteral()
+		if err != nil {
+			return nil, err
+		}
+		return &KVDeleteStmt{Table: table, Key: key}, nil
+	case p.isKeyword("scan"):
+		p.advance()
+		table := p.identLower()
+		st := &KVScanStmt{Table: table}
+		if p.peek().kind == tokString {
+			start, err := p.stringLiteral()
+			if err != nil {
+				return nil, err
+			}
+			st.Start = start
+			st.HasStart = true
+		}
+		if p.peek().kind == tokString {
+			end, err := p.stringLiteral()
+			if err != nil {
+				return nil, err
+			}
+			st.End = end
+			st.HasEnd = true
+		}
+		return st, nil
+	}
+	return nil, fmt.Errorf("expected PUT/GET/DELETE/SCAN after KV at pos %d", p.peek().pos)
+}
+
+func (p *Parser) stringLiteral() (string, error) {
+	t := p.peek()
+	if t.kind != tokString {
+		return "", fmt.Errorf("expected string literal at pos %d, got %q", t.pos, t.text)
+	}
+	p.advance()
+	return t.text, nil
 }
 
 func (p *Parser) parseCreate() (Statement, error) {
@@ -201,7 +280,56 @@ func (p *Parser) parseCreate() (Statement, error) {
 			return nil, err
 		}
 	}
+	// optional: ENGINE=<TABLE|KV|CSTORE>
+	if p.acceptKeyword("engine") {
+		if _, err := p.expect(tokOp, "="); err != nil {
+			return nil, fmt.Errorf("expected = after ENGINE at pos %d", p.peek().pos)
+		}
+		if p.peek().kind != tokIdent {
+			return nil, fmt.Errorf("expected engine name (TABLE|KV|CSTORE) at pos %d", p.peek().pos)
+		}
+		stmt.Engine = p.identLower()
+		switch stmt.Engine {
+		case "table", "kv", "cstore":
+		default:
+			return nil, fmt.Errorf("unknown ENGINE %q (want TABLE, KV or CSTORE)", stmt.Engine)
+		}
+	}
+	// optional: RETENTION = '<duration>' — auto-delete rows older than the window
+	if p.acceptKeyword("retention") {
+		if _, err := p.expect(tokOp, "="); err != nil {
+			return nil, fmt.Errorf("expected = after RETENTION at pos %d", p.peek().pos)
+		}
+		if p.peek().kind != tokString {
+			return nil, fmt.Errorf("expected RETENTION duration string (e.g. '24h', '7d') at pos %d", p.peek().pos)
+		}
+		d, err := parseRetention(p.advance().text)
+		if err != nil {
+			return nil, fmt.Errorf("bad RETENTION at pos %d: %v", p.peek().pos, err)
+		}
+		stmt.Retention = d
+	}
 	return stmt, nil
+}
+
+// parseRetention parses a retention window like "24h", "30m", "7d" or "3600s".
+func parseRetention(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 {
+		return 0, errors.New("too short")
+	}
+	if s[len(s)-1] == 'd' {
+		n, err := strconv.ParseInt(strings.TrimSpace(s[:len(s)-1]), 10, 64)
+		if err != nil || n <= 0 {
+			return 0, errors.New("invalid day count")
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, errors.New("invalid duration")
+	}
+	return d, nil
 }
 
 func typeFromKeyword(kw string) Type {
@@ -517,6 +645,25 @@ func (p *Parser) parseComparison() (Expr, error) {
 				op = "<>"
 			}
 			left = &BinaryOp{Op: op, Left: left, Right: right}
+			continue
+		}
+		if p.isKeyword("not") && p.peekAt(1).kind == tokIdent && strings.EqualFold(p.peekAt(1).text, "like") {
+			p.advance() // not
+			p.advance() // like
+			right, err := p.parseAdditive()
+			if err != nil {
+				return nil, err
+			}
+			left = &BinaryOp{Op: "NOT LIKE", Left: left, Right: right}
+			continue
+		}
+		if p.isKeyword("like") {
+			p.advance()
+			right, err := p.parseAdditive()
+			if err != nil {
+				return nil, err
+			}
+			left = &BinaryOp{Op: "LIKE", Left: left, Right: right}
 			continue
 		}
 		break

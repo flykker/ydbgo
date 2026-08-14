@@ -2,6 +2,7 @@ package sql
 
 import (
 	"testing"
+	"time"
 )
 
 func parseOne(t *testing.T, src string) Statement {
@@ -33,6 +34,46 @@ func TestParseCreateTable(t *testing.T) {
 	}
 	if ct.Columns[1].Name != "name" || ct.Columns[1].Type != TypeString || !ct.Columns[1].NotNull {
 		t.Errorf("col1 bad: %+v", ct.Columns[1])
+	}
+	// default engine is TABLE
+	if ct.Engine != "" {
+		t.Errorf("engine default: %q", ct.Engine)
+	}
+}
+
+func TestParseCreateTableEngine(t *testing.T) {
+	st := parseOne(t, `CREATE TABLE t (id int64 primary key, v string) ENGINE=KV`)
+	ct, ok := st.(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T", st)
+	}
+	if ct.Engine != "kv" {
+		t.Errorf("engine=%q want kv", ct.Engine)
+	}
+	st = parseOne(t, `CREATE TABLE t (id int64 primary key, v string) engine = cstore`)
+	if ct, ok := st.(*CreateTableStmt); !ok || ct.Engine != "cstore" {
+		t.Errorf("engine=cstore failed: %+v", st)
+	}
+	if _, err := Parse(`CREATE TABLE t (id int64 primary key) ENGINE=MYSTORE`); err == nil {
+		t.Fatal("expected error for unknown engine")
+	}
+}
+
+func TestParseCreateTableRetention(t *testing.T) {
+	st := parseOne(t, `CREATE TABLE t (ts timestamp primary key, v string) ENGINE=CSTORE RETENTION='24h'`)
+	ct, ok := st.(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T", st)
+	}
+	if ct.Retention != 24*time.Hour {
+		t.Errorf("retention=%v want 24h", ct.Retention)
+	}
+	st = parseOne(t, `CREATE TABLE t (ts timestamp primary key) RETENTION = '7d'`)
+	if ct, ok := st.(*CreateTableStmt); !ok || ct.Retention != 7*24*time.Hour {
+		t.Errorf("retention=7d failed: %+v", st)
+	}
+	if _, err := Parse(`CREATE TABLE t (ts timestamp primary key) RETENTION = 'xyz'`); err == nil {
+		t.Fatal("expected error for bad retention")
 	}
 }
 
@@ -136,5 +177,47 @@ func TestParseMultiple(t *testing.T) {
 	}
 	if len(stmts) != 3 {
 		t.Fatalf("got %d stmts", len(stmts))
+	}
+}
+
+func TestBinaryStatementCodec(t *testing.T) {
+	cases := []string{
+		`CREATE TABLE t (id int64 primary key, name string not null default 'x', age int64 default 0) ENGINE=KV`,
+		`DROP TABLE IF EXISTS t`,
+		`DROP INDEX IF EXISTS ix t`,
+		`INSERT INTO t (id, name, age) VALUES (1, 'a', 2), (3, 'b', 4)`,
+		`UPDATE t SET age = 31 WHERE name = 'Bob' AND id > 0`,
+		`DELETE FROM t WHERE id <= 5`,
+		`CREATE DATABASE db`,
+		`SELECT DISTINCT name, age FROM t WHERE age >= 30 GROUP BY name ORDER BY age DESC LIMIT 10`,
+		`BEGIN`,
+		`COMMIT`,
+		`ROLLBACK`,
+		`KV PUT kv_t 'key''1' 'value with ''quote'''`,
+		`KV GET kv_t 'somekey'`,
+		`KV DELETE kv_t 'somekey'`,
+		`KV SCAN kv_t`,
+		`KV SCAN kv_t 'a' 'm'`,
+		`KV SCAN kv_t 'a'`,
+	}
+	for _, sql := range cases {
+		in, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		enc := EncodeStatements(in)
+		out, err := DecodeStatements(enc)
+		if err != nil {
+			t.Fatalf("decode %q: %v", sql, err)
+		}
+		if len(out) != len(in) {
+			t.Fatalf("stmt count %q: %d vs %d", sql, len(out), len(in))
+		}
+		// text round-trip must match
+		for i := range in {
+			if StatementString(out[i]) != StatementString(in[i]) {
+				t.Errorf("%q mismatch:\n got  %s\n want %s", sql, StatementString(out[i]), StatementString(in[i]))
+			}
+		}
 	}
 }

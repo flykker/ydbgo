@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"time"
 
@@ -15,7 +17,8 @@ Usage:
   ydbgo serve [-addr host:port] [-data DIR]                 start the database server
   ydbgo serve -raft-addr R:PORT [-node-id ID]               start as a cluster node
            [-bootstrap] [-join HOST:PORT] [-rf N] [-shard-size BYTES]
-           [-split-check DURATION] [-recovery-check DURATION] [-addr ...]
+           [-split-check DURATION] [-recovery-check DURATION] [-ttl-tick DURATION]
+           [-addr ...]
   ydbgo run [-addr host:port] SQL...                        execute SQL against a server
   ydbgo repl [-addr host:port]                              interactive shell
   ydbgo bench -addr host:port [-n N] [-rows R] [-c C]       benchmark concurrent inserts
@@ -65,7 +68,12 @@ func runServe(args []string) {
 	shardSize := fs.Uint64("shard-size", 0, "auto-split threshold in bytes (0 = disabled)")
 	splitTick := fs.Duration("split-check", 5*time.Second, "auto-split check interval")
 	recoveryTick := fs.Duration("recovery-check", 0, "replica-heal check interval (0 = disabled)")
+	ttlTick := fs.Duration("ttl-tick", 0, "auto-TTL purge check interval (0 = disabled)")
+	pprofAddr := fs.String("pprof", "", "optional HTTP pprof listen address (e.g. :6060)")
 	fs.Parse(args)
+	if *pprofAddr != "" {
+		startPprof(*pprofAddr)
+	}
 	if *raftAddr == "" {
 		if err := server.RunServer(*addr, *data); err != nil {
 			fmt.Fprintln(os.Stderr, "serve:", err)
@@ -73,7 +81,7 @@ func runServe(args []string) {
 		}
 		return
 	}
-	if err := server.RunClusterServer(*addr, *data, *id, *raftAddr, *bootstrap, *join, *rf, *shardSize, *splitTick, *recoveryTick); err != nil {
+	if err := server.RunClusterServer(*addr, *data, *id, *raftAddr, *bootstrap, *join, *rf, *shardSize, *splitTick, *recoveryTick, *ttlTick); err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		os.Exit(1)
 	}
@@ -102,4 +110,21 @@ func runRepl(args []string) {
 		fmt.Fprintln(os.Stderr, "repl:", err)
 		os.Exit(1)
 	}
+}
+
+// startPprof exposes net/http/pprof so CPU/memory profiles can be captured from
+// a running node via "go tool pprof http://host:port/debug/pprof/profile".
+func startPprof(addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	go func() {
+		fmt.Fprintf(os.Stderr, "pprof listening on %s\n", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			fmt.Fprintln(os.Stderr, "pprof:", err)
+		}
+	}()
 }

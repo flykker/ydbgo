@@ -112,9 +112,31 @@ func Compare(a, b Value) (int, error) {
 			return 1, nil
 		}
 		return 0, nil
+	case a.Type == TypeString && b.Type == TypeTimestamp:
+		if t, err := time.Parse(time.RFC3339Nano, a.Str); err == nil {
+			return compareTimes(b.Tm, t)
+		}
+	case a.Type == TypeTimestamp && b.Type == TypeString:
+		if t, err := time.Parse(time.RFC3339Nano, b.Str); err == nil {
+			return compareTimes(a.Tm, t)
+		}
+	case a.Type == TypeTimestamp && b.Type == TypeInt:
+		return compareTimes(a.Tm, time.Unix(b.Int, 0))
+	case a.Type == TypeInt && b.Type == TypeTimestamp:
+		return compareTimes(time.Unix(a.Int, 0), b.Tm)
 	}
 	// cross-type string compare by display value
 	return strings.Compare(a.String(), b.String()), nil
+}
+
+func compareTimes(a, b time.Time) (int, error) {
+	switch {
+	case a.Before(b):
+		return -1, nil
+	case a.After(b):
+		return 1, nil
+	}
+	return 0, nil
 }
 
 // Convert coerces a value to a target type.
@@ -289,7 +311,7 @@ func evalBinary(n *BinaryOp, ctx map[string]Value) (Value, error) {
 		}
 		return NullValue, nil
 	}
-	if op == "LIKE" {
+	if op == "LIKE" || op == "NOT LIKE" {
 		l, err := Eval(n.Left, ctx)
 		if err != nil {
 			return NullValue, err
@@ -301,24 +323,11 @@ func evalBinary(n *BinaryOp, ctx map[string]Value) (Value, error) {
 		if l.Null || r.Null {
 			return NullValue, nil
 		}
-		pat := r.Str
-		var sb strings.Builder
-		sb.WriteString("^")
-		for _, c := range pat {
-			switch c {
-			case '%':
-				sb.WriteString(".*")
-			case '_':
-				sb.WriteString(".")
-			default:
-				sb.WriteString("\\Q")
-				sb.WriteRune(c)
-				sb.WriteString("\\E")
-			}
+		m := likeMatch(l.Str, r.Str)
+		if op == "NOT LIKE" {
+			return BoolValue(!m), nil
 		}
-		sb.WriteString("$")
-		re := newRe(sb.String())
-		return BoolValue(re(l.Str)), nil
+		return BoolValue(m), nil
 	}
 	l, err := Eval(n.Left, ctx)
 	if err != nil {

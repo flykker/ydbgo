@@ -22,30 +22,34 @@ func NewFSM(eng *storage.Engine) *FSM {
 	return &FSM{eng: eng, exec: sqlx.NewExecutor(eng)}
 }
 
-// Apply implements raft.FSM. The payload is one or more SQL write
-// statements separated by ';' (a group-committed batch). All statements of
-// the batch execute inside ONE durable store transaction, so the batch costs
-// a single storage fsync (group commit at the storage layer).
+// Apply implements raft.FSM. The payload is one or more write statements in
+// the compact binary encoding (sqlx.EncodeStatements), produced by the
+// leader's group-commit batcher. All statements of the batch execute inside
+// ONE durable store transaction, so the batch costs a single storage fsync
+// (group commit at the storage layer).
 func (f *FSM) Apply(l *raft.Log) interface{} {
-	stmts, err := sqlx.Parse(string(l.Data))
+	stmts, err := sqlx.DecodeStatements(l.Data)
 	if err != nil {
 		return err
 	}
 	if len(stmts) == 0 {
 		return nil
 	}
+	results := make([]*sqlx.Result, 0, len(stmts))
 	err = f.eng.UpdateBatch(func() error {
 		for _, st := range stmts {
-			if _, err := f.exec.Execute(st); err != nil {
+			r, err := f.exec.Execute(st)
+			if err != nil {
 				return err
 			}
+			results = append(results, r)
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	return nil
+	return results
 }
 
 // Snapshot serializes the current engine state as the FSM snapshot payload.
@@ -164,7 +168,7 @@ func (n *Node) Submit(sql string) error {
 		if isRead(st) {
 			continue
 		}
-		if err := n.submitOne(st); err != nil {
+		if _, err := n.submitOne(st); err != nil {
 			return err
 		}
 	}
@@ -172,11 +176,11 @@ func (n *Node) Submit(sql string) error {
 }
 
 // submitOne ships a single write statement through the group-commit batcher.
-func (n *Node) submitOne(st sqlx.Statement) error {
+func (n *Node) submitOne(st sqlx.Statement) (*sqlx.Result, error) {
 	if n.group == nil || !n.group.IsLeader() {
-		return errors.New("not leader")
+		return nil, errors.New("not leader")
 	}
-	return n.batch.submit(sqlx.StatementString(st))
+	return n.batch.submit(st)
 }
 
 // Execute runs a statement: writes go through Raft, reads run locally.
@@ -195,10 +199,11 @@ func (n *Node) Execute(sql string) (*sqlx.Result, error) {
 			last = r
 			continue
 		}
-		if err := n.submitOne(st); err != nil {
+		r, err := n.submitOne(st)
+		if err != nil {
 			return nil, err
 		}
-		last = &sqlx.Result{Type: resultType(st)}
+		last = r
 	}
 	return last, nil
 }
@@ -220,30 +225,12 @@ func isRead(st sqlx.Statement) bool {
 	switch st.(type) {
 	case *sqlx.SelectStmt:
 		return true
+	case *sqlx.KVGetStmt:
+		return true
+	case *sqlx.KVScanStmt:
+		return true
 	}
 	return false
-}
-
-func resultType(st sqlx.Statement) string {
-	switch st.(type) {
-	case *sqlx.CreateTableStmt:
-		return "create_table"
-	case *sqlx.DropTableStmt:
-		return "drop_table"
-	case *sqlx.InsertStmt:
-		return "insert"
-	case *sqlx.UpdateStmt:
-		return "update"
-	case *sqlx.DeleteStmt:
-		return "delete"
-	case *sqlx.CreateIndexStmt:
-		return "create_index"
-	case *sqlx.DropIndexStmt:
-		return "drop_index"
-	case *sqlx.CreateDatabaseStmt:
-		return "create_database"
-	}
-	return "ok"
 }
 
 // Leader helpers.

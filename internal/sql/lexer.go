@@ -49,7 +49,7 @@ var keywords = map[string]bool{
 	"key": true, "default": true, "int": true, "float": true,
 	"double": true, "string": true, "text": true, "bool": true,
 	"timestamp": true, "desc": true, "asc": true, "cast": true,
-	"in": true, "between": true, "like": true,
+	"in": true, "between": true, "like": true, "engine": true,
 }
 
 func (l *lexer) next() (token, error) {

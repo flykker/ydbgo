@@ -1,5 +1,7 @@
 package sql
 
+import "time"
+
 type Node interface{}
 
 type Type int
@@ -83,6 +85,8 @@ type CreateTableStmt struct {
 	Columns     []ColumnDef
 	PK          []string
 	IfNotExists bool
+	Engine      string        // "TABLE" (default), "KV", "CSTORE" — from ENGINE=<name>
+	Retention   time.Duration // rows older than now-retention are auto-deleted (0 = disabled)
 }
 
 type DropTableStmt struct {
@@ -152,4 +156,28 @@ type RollbackStmt struct{}
 
 type CreateDatabaseStmt struct {
 	Name string
+}
+
+type KVPutStmt struct {
+	Table string
+	Key   string
+	Value string
+}
+
+type KVGetStmt struct {
+	Table string
+	Key   string
+}
+
+type KVDeleteStmt struct {
+	Table string
+	Key   string
+}
+
+type KVScanStmt struct {
+	Table    string
+	Start    string
+	End      string
+	HasStart bool
+	HasEnd   bool
 }

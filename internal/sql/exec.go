@@ -1,13 +1,17 @@
 package sql
 
+import "time"
+
 // Row is an ordered slice of values.
 type Row []Value
 
 // TableSchema describes a table's columns.
 type TableSchema struct {
-	Name    string
-	Columns []ColumnDef
-	PK      []string
+	Name      string
+	Columns   []ColumnDef
+	PK        []string
+	Engine    string        // storage engine: "TABLE", "KV", "CSTORE" ("" = TABLE)
+	Retention time.Duration // rows older than now-retention are auto-deleted (0 = disabled)
 }
 
 // Engine is the storage interface used by the executor.
@@ -20,6 +24,25 @@ type Engine interface {
 	Scan(table string) ([]Row, error)
 	Update(table string, pkValues []Value, set map[string]Value) error
 	Delete(table string, pkValues []Value) error
+	// DeleteRange removes every row whose encoded PK falls inside the range
+	// (nil bounds = unbounded). Only CSTORE tables support range deletion.
+	DeleteRange(table string, r *PKRange) (int64, error)
+}
+
+// KVEngine is the raw byte-KV surface for ENGINE=KV tables. It is an optional
+// capability: engines that do not back a KV layout (union/empty engines used
+// for sharded scatter) do not implement it and KV statements fail cleanly.
+type KVEngine interface {
+	KVPut(table string, key, value string) error
+	KVGet(table string, key string) (Value, error)
+	KVDelete(table string, key string) error
+	KVScan(table string, start, end string) ([]KVEntry, error)
+}
+
+// KVEntry is one raw key/value pair returned by a KV SCAN.
+type KVEntry struct {
+	Key   string
+	Value string
 }
 
 // Result is the outcome of executing a statement.
@@ -27,7 +50,7 @@ type Result struct {
 	Columns  []string // column names (SELECT)
 	Rows     []Row    // result rows (SELECT)
 	Affected int64    // affected rows for DML
-	Type     string   // "select","insert","update","delete","create_table","drop_table","begin","commit","rollback","create_index","drop_index","create_database"
+	Type     string   // "select","insert","update","delete","create_table","drop_table","begin","commit","rollback","create_index","drop_index","create_database","kv_put","kv_get","kv_delete","kv_scan"
 }
 
 // Executor executes parsed statements against an Engine.
@@ -64,13 +87,94 @@ func (ex *Executor) Execute(st Statement) (*Result, error) {
 		return &Result{Type: "rollback"}, nil
 	case *CreateDatabaseStmt:
 		return &Result{Type: "create_database"}, nil
+	case *KVPutStmt:
+		return ex.execKVPut(s)
+	case *KVGetStmt:
+		return ex.execKVGet(s)
+	case *KVDeleteStmt:
+		return ex.execKVDelete(s)
+	case *KVScanStmt:
+		return ex.execKVScan(s)
 	}
 	return nil, &ExecError{Msg: "unsupported statement"}
+}
+
+func (ex *Executor) kvEngine() (KVEngine, error) {
+	ke, ok := ex.Eng.(KVEngine)
+	if !ok {
+		return nil, &ExecError{Msg: "engine does not support raw KV operations"}
+	}
+	return ke, nil
+}
+
+func (ex *Executor) execKVPut(s *KVPutStmt) (*Result, error) {
+	ke, err := ex.kvEngine()
+	if err != nil {
+		return nil, err
+	}
+	if err := ke.KVPut(s.Table, s.Key, s.Value); err != nil {
+		return nil, err
+	}
+	return &Result{Type: "kv_put", Affected: 1}, nil
+}
+
+func (ex *Executor) execKVGet(s *KVGetStmt) (*Result, error) {
+	ke, err := ex.kvEngine()
+	if err != nil {
+		return nil, err
+	}
+	v, err := ke.KVGet(s.Table, s.Key)
+	if err != nil {
+		return nil, err
+	}
+	if v.Null {
+		return &Result{Type: "kv_get", Columns: []string{"key", "value"}, Rows: nil}, nil
+	}
+	return &Result{Type: "kv_get", Columns: []string{"key", "value"}, Rows: []Row{{StrValue(s.Key), v}}}, nil
+}
+
+func (ex *Executor) execKVDelete(s *KVDeleteStmt) (*Result, error) {
+	ke, err := ex.kvEngine()
+	if err != nil {
+		return nil, err
+	}
+	if err := ke.KVDelete(s.Table, s.Key); err != nil {
+		return nil, err
+	}
+	return &Result{Type: "kv_delete", Affected: 1}, nil
+}
+
+func (ex *Executor) execKVScan(s *KVScanStmt) (*Result, error) {
+	ke, err := ex.kvEngine()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := ke.KVScan(s.Table, s.Start, s.End)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]Row, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, Row{StrValue(e.Key), StrValue(e.Value)})
+	}
+	return &Result{Type: "kv_scan", Columns: []string{"key", "value"}, Rows: rows, Affected: int64(len(rows))}, nil
 }
 
 type ExecError struct{ Msg string }
 
 func (e *ExecError) Error() string { return e.Msg }
+
+// engineOf normalizes the ENGINE clause to its canonical uppercase name.
+func engineOf(e string) string {
+	switch e {
+	case "kv":
+		return "KV"
+	case "cstore":
+		return "CSTORE"
+	default:
+		return "TABLE"
+	}
+}
 
 func (ex *Executor) execCreateTable(s *CreateTableStmt) (*Result, error) {
 	if ex.Eng == nil {
@@ -105,7 +209,7 @@ func (ex *Executor) execCreateTable(s *CreateTableStmt) (*Result, error) {
 			pk = append(pk, c.Name)
 		}
 	}
-	schema := &TableSchema{Name: s.Name, Columns: cols, PK: pk}
+	schema := &TableSchema{Name: s.Name, Columns: cols, PK: pk, Engine: engineOf(s.Engine), Retention: s.Retention}
 	if err := ex.Eng.CreateTable(schema); err != nil {
 		return nil, err
 	}
@@ -233,6 +337,18 @@ func (ex *Executor) execDelete(s *DeleteStmt) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// CSTORE retention: a WHERE that is exactly a range over PK columns is a
+	// columnar range delete (markers + cells in one pass), instead of a full
+	// scan with per-row deletes.
+	if schema.Engine == "CSTORE" {
+		if rng, exact := PKRangeFromWhere(schema, s.Where); exact && rng != nil && (rng.Lower != nil || rng.Upper != nil) {
+			affected, err := ex.Eng.DeleteRange(s.Table, rng)
+			if err != nil {
+				return nil, err
+			}
+			return &Result{Type: "delete", Affected: affected}, nil
+		}
+	}
 	rows, err := ex.Eng.Scan(s.Table)
 	if err != nil {
 		return nil, err
@@ -264,14 +380,39 @@ func (ex *Executor) execDelete(s *DeleteStmt) (*Result, error) {
 
 func (ex *Executor) execSelect(s *SelectStmt) (*Result, error) {
 	var schema *TableSchema
-	var rows []Row
 	if s.From != "" {
 		var err error
 		schema, err = ex.Eng.GetSchema(s.From)
 		if err != nil {
 			return nil, err
 		}
-		rows, err = ex.Eng.Scan(s.From)
+	}
+	// whole-table aggregates over CSTORE: push down before scanning any rows
+	hasAgg := false
+	for _, it := range s.Items {
+		if isAggregate(it.Expr) {
+			hasAgg = true
+			break
+		}
+	}
+	if hasAgg {
+		if r, ok, err := ex.aggregatePushdown(s, schema); err != nil {
+			return nil, err
+		} else if ok {
+			return r, nil
+		}
+	}
+	if len(s.GroupBy) > 0 {
+		if r, ok, err := ex.groupedPushdown(s, schema); err != nil {
+			return nil, err
+		} else if ok {
+			return r, nil
+		}
+	}
+	var rows []Row
+	if s.From != "" {
+		var err error
+		rows, err = ex.rowsFor(s, schema)
 		if err != nil {
 			return nil, err
 		}
@@ -300,15 +441,13 @@ func (ex *Executor) execSelect(s *SelectStmt) (*Result, error) {
 		}
 		contexts = filtered
 	}
+	// order by: sort full-width contexts before projection so sort keys that
+	// are not selected still resolve; grouped results are not supported here.
+	if len(s.OrderBy) > 0 && !hasAgg && len(s.GroupBy) == 0 {
+		sortContexts(contexts, s.OrderBy)
+	}
 	// group by + aggregates
 	var out []Row
-	hasAgg := false
-	for _, it := range s.Items {
-		if isAggregate(it.Expr) {
-			hasAgg = true
-			break
-		}
-	}
 	if hasAgg {
 		groups := map[string][]map[string]Value{}
 		for _, ctx := range contexts {
@@ -319,6 +458,19 @@ func (ex *Executor) execSelect(s *SelectStmt) (*Result, error) {
 			row := make(Row, len(s.Items))
 			for i, it := range s.Items {
 				v, err := evalSelectItemAgg(it.Expr, group)
+				if err != nil {
+					return nil, err
+				}
+				row[i] = v
+			}
+			out = append(out, row)
+		}
+		// a plain aggregate (no GROUP BY) over an empty input still yields one
+		// row: count=0, min/max/sum/avg = NULL
+		if len(s.GroupBy) == 0 && len(out) == 0 {
+			row := make(Row, len(s.Items))
+			for i, it := range s.Items {
+				v, err := evalSelectItemAgg(it.Expr, nil)
 				if err != nil {
 					return nil, err
 				}
@@ -374,26 +526,11 @@ func (ex *Executor) execSelect(s *SelectStmt) (*Result, error) {
 		}
 		out = filtered
 	}
-	// order by
-	if len(s.OrderBy) > 0 && len(s.GroupBy) == 0 {
-		sortRows(out, s.OrderBy, schema)
-	} else if len(s.OrderBy) > 0 && hasAgg {
-		// order by over aggregated result using item aliases/positions not supported simply
-	}
 	// limit
 	if s.HasLimit && int(s.Limit) < len(out) {
 		out = out[:s.Limit]
 	}
 	// column names
-	cols := make([]string, len(s.Items))
-	for i, it := range s.Items {
-		if it.Alias != "" {
-			cols[i] = it.Alias
-		} else if id, ok := it.Expr.(*Ident); ok {
-			cols[i] = id.Name
-		} else {
-			cols[i] = "col" + string(rune('0'+i))
-		}
-	}
+	cols := resultColumns(s.Items)
 	return &Result{Type: "select", Columns: cols, Rows: out, Affected: int64(len(out))}, nil
 }

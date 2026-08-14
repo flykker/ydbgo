@@ -2,11 +2,12 @@ package raftsvc
 
 import (
 	"errors"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"
+
+	sqlx "ydbgo/internal/sql"
 )
 
 // Batch config bounds for group-committed raft entries.
@@ -19,8 +20,9 @@ const (
 
 // batchItem is one caller's write statement waiting for commit.
 type batchItem struct {
-	text string
-	err  chan error
+	st  sqlx.Statement
+	res chan *sqlx.Result
+	err chan error
 }
 
 // batcher coalesces concurrent leader writes into a single raft.Apply per
@@ -28,6 +30,10 @@ type batchItem struct {
 // fsync + one quorum round-trip each now share a single raft entry, so N
 // writes cost ~1 fsync + 1 round-trip per batch. Durability is unchanged:
 // every statement is still committed to a majority before its caller returns.
+//
+// Entries carry the leader's parsed statements in a compact binary encoding
+// (sqlx.EncodeStatements) rather than SQL text: followers apply without
+// re-parsing and the entry is smaller on the wire and in the raft log.
 type batcher struct {
 	getRaft func() *raft.Raft
 
@@ -60,10 +66,15 @@ func (b *batcher) Stop() {
 // submit enqueues a statement and blocks until it commits. While the flush
 // loop is inside a raft.Apply the buffer absorbs backpressure; callers wait
 // for their commit either way, matching pre-batch semantics.
-func (b *batcher) submit(text string) error {
-	item := &batchItem{text: text, err: make(chan error, 1)}
+func (b *batcher) submit(st sqlx.Statement) (*sqlx.Result, error) {
+	item := &batchItem{st: st, res: make(chan *sqlx.Result, 1), err: make(chan error, 1)}
 	b.ch <- item
-	return <-item.err
+	select {
+	case res := <-item.res:
+		return res, nil
+	case err := <-item.err:
+		return nil, err
+	}
 }
 
 // loop drains the window, folding statements into one apply per flush.
@@ -106,18 +117,32 @@ func (b *batcher) apply(pending []*batchItem) {
 		b.fail(pending, errors.New("raft not started"))
 		return
 	}
-	texts := make([]string, 0, len(pending))
+	stmts := make([]sqlx.Statement, 0, len(pending))
 	for _, it := range pending {
-		texts = append(texts, it.text)
+		stmts = append(stmts, it.st)
 	}
-	f := r.Apply([]byte(strings.Join(texts, "; ")), applyTimeout)
+	payload := sqlx.EncodeStatements(stmts)
+	f := r.Apply(payload, applyTimeout)
 	err := f.Error()
+	var results []*sqlx.Result
 	if err == nil {
-		if resp, ok := f.Response().(error); ok {
-			err = resp
+		if resp, ok := f.Response().([]*sqlx.Result); ok {
+			results = resp
+		} else if respErr, ok := f.Response().(error); ok {
+			err = respErr
 		}
 	}
-	b.fail(pending, err)
+	if err != nil {
+		b.fail(pending, err)
+		return
+	}
+	for i, it := range pending {
+		var res *sqlx.Result
+		if i < len(results) {
+			res = results[i]
+		}
+		it.res <- res
+	}
 }
 
 func (b *batcher) fail(pending []*batchItem, err error) {

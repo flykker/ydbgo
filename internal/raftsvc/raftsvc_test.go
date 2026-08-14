@@ -74,6 +74,84 @@ func TestSingleNodeCluster(t *testing.T) {
 	}
 }
 
+// TestKVRawReplication exercises the raw byte-KV surface end to end through
+// raft: CREATE TABLE ... ENGINE=KV, then KV PUT/GET/DELETE/SCAN as raft entries,
+// plus persistence across restart (the FSM snapshot roundtrip includes the raw
+// KV area).
+func TestKVRawReplication(t *testing.T) {
+	n, err := NewNode(Config{
+		ID:       "n1",
+		RaftAddr: freePort(t),
+		DataDir:  filepath.Join(t.TempDir(), "data"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	if err := n.Start(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitLeader(t, n, 5*time.Second)
+
+	if _, err := n.Execute("CREATE TABLE kv_t (id int64 primary key) ENGINE=KV"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Execute("KV PUT kv_t 'alpha' '1'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Execute("KV PUT kv_t 'beta' '2'"); err != nil {
+		t.Fatal(err)
+	}
+	r, err := n.Execute("KV GET kv_t 'beta'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 1 || r.Rows[0][1].Str != "2" {
+		t.Errorf("kv get rows=%v", r.Rows)
+	}
+	if _, err := n.Execute("KV DELETE kv_t 'alpha'"); err != nil {
+		t.Fatal(err)
+	}
+	r, err = n.Execute("KV SCAN kv_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 1 || r.Rows[0][0].Str != "beta" || r.Rows[0][1].Str != "2" {
+		t.Errorf("kv scan rows=%v", r.Rows)
+	}
+	// raw KV on a non-KV table must fail
+	if _, err := n.Execute("CREATE TABLE row_t (id int64 primary key)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Execute("KV PUT row_t 'k' 'v'"); err == nil {
+		t.Fatal("KV PUT on TABLE engine should fail")
+	}
+	// persistence across restart (snapshot includes raw KV area)
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	n2, err := NewNode(Config{
+		ID:       "n1",
+		RaftAddr: freePort(t),
+		DataDir:  n.dataDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	if err := n2.Start(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitLeader(t, n2, 5*time.Second)
+	r, err = n2.Execute("KV SCAN kv_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 1 || r.Rows[0][0].Str != "beta" {
+		t.Errorf("kv scan after restart=%v", r.Rows)
+	}
+}
+
 func TestThreeNodeCluster(t *testing.T) {
 	base := t.TempDir()
 	addrs := []string{freePort(t), freePort(t), freePort(t)}

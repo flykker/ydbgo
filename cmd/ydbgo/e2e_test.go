@@ -8,9 +8,29 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer is a concurrency-safe bytes.Buffer for capturing a child
+// process's stdout/stderr while the process is still running.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func buildBinary(t *testing.T) string {
 	t.Helper()
@@ -93,10 +113,10 @@ func TestCLIClusterJoinAndReplicate(t *testing.T) {
 	addr1, addr2 := "127.0.0.1:2491", "127.0.0.1:2492"
 	raft1, raft2 := "127.0.0.1:2493", "127.0.0.1:2494"
 
-	start := func(args ...string) (*exec.Cmd, *bytes.Buffer) {
+	start := func(args ...string) (*exec.Cmd, *syncBuffer) {
 		full := append([]string{"serve"}, args...)
 		cmd := exec.Command(bin, full...)
-		var buf bytes.Buffer
+		var buf syncBuffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
 		if err := cmd.Start(); err != nil {

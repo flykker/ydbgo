@@ -26,6 +26,7 @@ type Config struct {
 	ShardSize    uint64 // split threshold in bytes (0 = auto-split disabled)
 	SplitTick    time.Duration
 	RecoveryTick time.Duration // replica-heal check interval (0 = disabled)
+	TTLTick      time.Duration // retention purge check interval (0 = disabled)
 }
 
 // ManagedShard is the local replica of one data shard (a Raft group).
@@ -34,6 +35,12 @@ type ManagedShard struct {
 	node   *raftsvc.Node
 	schema *sqlx.TableSchema
 	frozen bool // writes rejected while a split migrates rows
+
+	// leader cache: avoids a fresh TCP dial + leader resolution on every
+	// routed DML for a shard whose leader is remote.
+	ldrMu    sync.Mutex
+	ldrAddr  string
+	ldrValid time.Time
 }
 
 // Manager owns the meta group and all locally-hosted data shards, and routes
@@ -48,6 +55,7 @@ type Manager struct {
 	shardSize    uint64
 	splitTick    time.Duration
 	recoveryTick time.Duration
+	ttlTick      time.Duration
 
 	meta   *MetaNode
 	shards map[string]*ManagedShard
@@ -81,6 +89,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		shardSize:    cfg.ShardSize,
 		splitTick:    cfg.SplitTick,
 		recoveryTick: cfg.RecoveryTick,
+		ttlTick:      cfg.TTLTick,
 		meta:         meta,
 		shards:       map[string]*ManagedShard{},
 		pool:         proto.NewConnPool(16),
@@ -143,6 +152,10 @@ func (m *Manager) Start(bootstrap bool, joinAddr string) error {
 	if m.recoveryTick > 0 {
 		m.wg.Add(1)
 		go m.recoveryLoop()
+	}
+	if m.ttlTick > 0 {
+		m.wg.Add(1)
+		go m.ttlLoop()
 	}
 	return nil
 }
@@ -252,8 +265,15 @@ func (m *Manager) Handle(req *proto.Request) *proto.Response {
 }
 
 func (m *Manager) isRead(st sqlx.Statement) bool {
-	_, ok := st.(*sqlx.SelectStmt)
-	return ok
+	switch st.(type) {
+	case *sqlx.SelectStmt:
+		return true
+	case *sqlx.KVGetStmt:
+		return true
+	case *sqlx.KVScanStmt:
+		return true
+	}
+	return false
 }
 
 func (m *Manager) route(st sqlx.Statement) (*sqlx.Result, error) {
@@ -282,6 +302,14 @@ func (m *Manager) route(st sqlx.Statement) (*sqlx.Result, error) {
 		return &sqlx.Result{Type: "drop_index"}, nil
 	case *sqlx.CreateDatabaseStmt:
 		return &sqlx.Result{Type: "create_database"}, nil
+	case *sqlx.KVPutStmt:
+		return m.execKVPut(s)
+	case *sqlx.KVGetStmt:
+		return m.execKVGet(s)
+	case *sqlx.KVDeleteStmt:
+		return m.execKVDelete(s)
+	case *sqlx.KVScanStmt:
+		return m.execKVScan(s)
 	}
 	return nil, errors.New("unsupported statement")
 }
@@ -395,19 +423,34 @@ func (m *Manager) localShard(id string) *ManagedShard {
 	return m.shards[id]
 }
 
+const shardLeaderCacheTTL = time.Second
+
 // shardLeaderSQLAddr resolves the shard group's leader to its node's SQL
-// address. It prefers the raft-reported leader ID once it resolves to a
-// registered catalog node; during the fresh-join window (before the follower
-// applies the config change) the leader is always the bootstrapping placement
-// node spec.Nodes[0].
+// address. The result is cached for shardLeaderCacheTTL so the hot DML path
+// does not dial the network on every statement.
 func (m *Manager) shardLeaderSQLAddr(sh *ManagedShard, d time.Duration) (string, error) {
+	sh.ldrMu.Lock()
+	if sh.ldrAddr != "" && time.Since(sh.ldrValid) < shardLeaderCacheTTL {
+		addr := sh.ldrAddr
+		sh.ldrMu.Unlock()
+		return addr, nil
+	}
+	sh.ldrMu.Unlock()
+
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		if sh.node.IsLeader() {
-			return m.sqlAddr, nil
+			addr := m.sqlAddr
+			sh.ldrMu.Lock()
+			sh.ldrAddr, sh.ldrValid = addr, time.Now()
+			sh.ldrMu.Unlock()
+			return addr, nil
 		}
 		if id := sh.node.Group().LeaderID(); id != "" {
 			if addr := m.nodeSQLAddr(id); addr != "" {
+				sh.ldrMu.Lock()
+				sh.ldrAddr, sh.ldrValid = addr, time.Now()
+				sh.ldrMu.Unlock()
 				return addr, nil
 			}
 		}
@@ -421,6 +464,9 @@ func (m *Manager) shardLeaderSQLAddr(sh *ManagedShard, d time.Duration) (string,
 			}
 			addr := m.nodeSQLAddr(id)
 			if addr != "" && nodeReachable(addr) {
+				sh.ldrMu.Lock()
+				sh.ldrAddr, sh.ldrValid = addr, time.Now()
+				sh.ldrMu.Unlock()
 				return addr, nil
 			}
 		}
@@ -439,13 +485,13 @@ func contains(xs []string, v string) bool {
 }
 
 // scanShard reads all rows from one shard (local read preferred).
-func (m *Manager) scanShard(spec *ShardSpec) ([]sqlx.Row, error) {
+func (m *Manager) scanShard(spec *ShardSpec, sql string) ([]sqlx.Row, error) {
 	if m.hosts(spec) {
 		sh := m.localShard(spec.ID)
 		if sh == nil {
 			return nil, fmt.Errorf("shard %s not mounted locally", spec.ID)
 		}
-		r, err := sh.node.Execute("SELECT * FROM " + spec.Table)
+		r, err := sh.node.Execute(sql)
 		if err != nil {
 			return nil, err
 		}
@@ -457,7 +503,7 @@ func (m *Manager) scanShard(spec *ShardSpec) ([]sqlx.Row, error) {
 	}
 	var resp *proto.Response
 	err := m.pool.Do(addr, func(c *proto.Client) error {
-		r, err := c.Execute(fmt.Sprintf("ADMIN SCAN-SHARD %s %s", spec.Table, spec.ID))
+		r, err := c.Execute(fmt.Sprintf("ADMIN SCAN-SHARD %s %s %s", spec.Table, spec.ID, sql))
 		if err != nil {
 			return err
 		}
@@ -475,6 +521,110 @@ func (m *Manager) scanShard(spec *ShardSpec) ([]sqlx.Row, error) {
 		return nil, fmt.Errorf("table %q not found", spec.Table)
 	}
 	return rowsFromPayload(resp.Result, ts.Schema), nil
+}
+
+// scanShardTyped pushes a shard-local SELECT whose result columns do NOT match
+// the table schema (partial aggregates / grouped partials). Locally hosted
+// shards return typed rows directly; remote shards' rows, which arrive as
+// strings, are reconstructed with the plan's expected column types.
+func (m *Manager) scanShardTyped(spec *ShardSpec, sql string, types []sqlx.Type) ([]sqlx.Row, error) {
+	if m.hosts(spec) {
+		sh := m.localShard(spec.ID)
+		if sh == nil {
+			return nil, fmt.Errorf("shard %s not mounted locally", spec.ID)
+		}
+		r, err := sh.node.Execute(sql)
+		if err != nil {
+			return nil, err
+		}
+		return r.Rows, nil
+	}
+	addr := m.livePlacementAddr(spec)
+	if addr == "" {
+		return nil, fmt.Errorf("shard %s has no live placement", spec.ID)
+	}
+	var resp *proto.Response
+	err := m.pool.Do(addr, func(c *proto.Client) error {
+		r, err := c.Execute(fmt.Sprintf("ADMIN SCAN-SHARD %s %s %s", spec.Table, spec.ID, sql))
+		if err != nil {
+			return err
+		}
+		resp = r
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, errors.New(resp.Error)
+	}
+	return rowsFromPayloadTyped(resp.Result, types), nil
+}
+
+// scanShardProjected reads only the given columns from one shard so CSTORE
+// nodes can run columnar scans, then pads each row back to full schema width.
+// whereSQL is an optional " WHERE ..." clause pushed down so the shard-local
+// scan can prune to the query's PK range.
+func (m *Manager) scanShardProjected(spec *ShardSpec, cols []string, whereSQL string) ([]sqlx.Row, error) {
+	ts := m.table(spec.Table)
+	if ts == nil {
+		return nil, fmt.Errorf("table %q not found", spec.Table)
+	}
+	stmt := "SELECT " + strings.Join(cols, ", ") + " FROM " + spec.Table + whereSQL
+	if m.hosts(spec) {
+		sh := m.localShard(spec.ID)
+		if sh == nil {
+			return nil, fmt.Errorf("shard %s not mounted locally", spec.ID)
+		}
+		r, err := sh.node.Execute(stmt)
+		if err != nil {
+			return nil, err
+		}
+		return expandProjected(cols, ts.Schema, r.Rows), nil
+	}
+	addr := m.livePlacementAddr(spec)
+	if addr == "" {
+		return nil, fmt.Errorf("shard %s has no live placement", spec.ID)
+	}
+	var resp *proto.Response
+	err := m.pool.Do(addr, func(c *proto.Client) error {
+		r, err := c.Execute(fmt.Sprintf("ADMIN EXEC-SHARD %s %s %s", spec.Table, spec.ID, stmt))
+		if err != nil {
+			return err
+		}
+		resp = r
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, errors.New(resp.Error)
+	}
+	return expandProjected(cols, ts.Schema, rowsFromPayload(resp.Result, ts.Schema)), nil
+}
+
+// expandProjected reorders/pads projected (narrow) rows back to full schema
+// width, filling untouched columns with type zeroes.
+func expandProjected(cols []string, schema *sqlx.TableSchema, rows []sqlx.Row) []sqlx.Row {
+	colIdx := map[string]int{}
+	for i, name := range cols {
+		colIdx[name] = i
+	}
+	out := make([]sqlx.Row, 0, len(rows))
+	for _, r := range rows {
+		row := make(sqlx.Row, len(schema.Columns))
+		for i, c := range schema.Columns {
+			ci, ok := colIdx[c.Name]
+			if !ok || ci >= len(r) {
+				row[i] = zeroForType(c.Type)
+				continue
+			}
+			row[i] = r[ci]
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 // mount / unmount

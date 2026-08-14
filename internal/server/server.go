@@ -1,45 +1,55 @@
 package server
 
 import (
-	"bufio"
-	"encoding/json"
+	"context"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 	"sync"
 
+	"google.golang.org/grpc"
+
 	"ydbgo/internal/proto"
 	"ydbgo/internal/raftsvc"
+	"ydbgo/internal/rpc"
 	"ydbgo/internal/shard"
 	"ydbgo/internal/sql"
 )
 
-// Server serves SQL over TCP.
+// Server serves SQL over gRPC.
 type Server struct {
+	rpc.UnimplementedYdbServiceServer
+	gs          *grpc.Server
 	ln          net.Listener
 	exec        *sql.Executor
 	node        *raftsvc.Node
 	shards      *shard.Manager
 	forwardAddr string // fallback peer SQL address for non-leaders
-	mu          sync.Mutex
-	closed      bool
 }
 
 func NewServer(eng sql.Engine) *Server {
-	return &Server{exec: sql.NewExecutor(eng)}
+	s := &Server{exec: sql.NewExecutor(eng)}
+	s.gs = grpc.NewServer()
+	rpc.RegisterYdbServiceServer(s.gs, s)
+	return s
 }
 
 // NewClusterServer wraps a Raft node; writes go through consensus.
 // forwardAddr is the SQL address of a peer used to forward requests when
 // this node is not the leader (the peer chains to the current leader).
 func NewClusterServer(n *raftsvc.Node, forwardAddr string) *Server {
-	return &Server{node: n, forwardAddr: forwardAddr}
+	s := &Server{node: n, forwardAddr: forwardAddr}
+	s.gs = grpc.NewServer()
+	rpc.RegisterYdbServiceServer(s.gs, s)
+	return s
 }
 
 // NewShardedServer wraps a shard manager; all routing happens there.
 func NewShardedServer(m *shard.Manager) *Server {
-	return &Server{shards: m}
+	s := &Server{shards: m}
+	s.gs = grpc.NewServer()
+	rpc.RegisterYdbServiceServer(s.gs, s)
+	return s
 }
 
 // Listen starts accepting connections on addr.
@@ -55,49 +65,49 @@ func (s *Server) Listen(addr string) error {
 func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 
 func (s *Server) Serve() error {
-	for {
-		conn, err := s.ln.Accept()
-		if err != nil {
-			s.mu.Lock()
-			closed := s.closed
-			s.mu.Unlock()
-			if closed {
-				return nil
-			}
-			continue
-		}
-		go s.handleConn(conn)
-	}
+	return s.gs.Serve(s.ln)
 }
 
 func (s *Server) Close() error {
-	s.mu.Lock()
-	s.closed = true
-	s.mu.Unlock()
+	s.gs.Stop()
 	if s.ln != nil {
 		return s.ln.Close()
 	}
 	return nil
 }
 
-func (s *Server) handleConn(conn net.Conn) {
-	defer conn.Close()
-	br := bufio.NewReader(conn)
-	bw := bufio.NewWriter(conn)
-	dec := json.NewDecoder(br)
+// Execute implements rpc.YdbServiceServer (single request/response).
+func (s *Server) Execute(_ context.Context, req *rpc.Request) (*rpc.Response, error) {
+	return proto.ToRPCResponse(s.handle(&proto.Request{ID: req.Id, SQL: req.Sql})), nil
+}
+
+// Stream implements rpc.YdbServiceServer (bidirectional, matched by id).
+// Requests are handled by a bounded worker pool so one stream saturates many
+// cores without spawning a goroutine per request; Send is serialized because
+// a stream admits one writer at a time.
+// Stream implements rpc.YdbServiceServer (bidirectional, matched by id).
+// Requests are handled concurrently so one stream saturates many cores; Send
+// is serialized because a stream admits one writer at a time.
+func (s *Server) Stream(stream rpc.YdbService_StreamServer) error {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	for {
-		var req proto.Request
-		err := dec.Decode(&req)
+		req, err := stream.Recv()
 		if err != nil {
-			if err != io.EOF {
-				s.writeError(bw, 0, fmt.Sprintf("bad request: %v", err))
-				bw.Flush()
-			}
-			return
+			return err
 		}
-		resp := s.handle(&req)
-		s.writeJSON(bw, resp)
-		bw.Flush()
+		wg.Add(1)
+		go func(req *rpc.Request) {
+			defer wg.Done()
+			resp := s.handle(&proto.Request{ID: req.Id, SQL: req.Sql})
+			mu.Lock()
+			if err := stream.Send(proto.ToRPCResponse(resp)); err != nil {
+				mu.Unlock()
+				return
+			}
+			mu.Unlock()
+		}(req)
 	}
 }
 
@@ -219,14 +229,9 @@ func payloadOf(r *sql.Result) *proto.ResultPayload {
 	return p
 }
 
-func (s *Server) writeJSON(w io.Writer, v interface{}) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return
+func (s *Server) String() string {
+	if s.ln != nil {
+		return fmt.Sprintf("grpc server on %s", s.ln.Addr())
 	}
-	w.Write(append(b, '\n'))
-}
-
-func (s *Server) writeError(w io.Writer, id int64, msg string) {
-	s.writeJSON(w, &proto.Response{ID: id, OK: false, Error: msg})
+	return "grpc server (not listening)"
 }

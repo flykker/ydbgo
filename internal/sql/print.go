@@ -70,8 +70,28 @@ func StatementString(st Statement) string {
 		return "rollback"
 	case *CreateDatabaseStmt:
 		return "create database " + n.Name
+	case *KVPutStmt:
+		return "kv put " + n.Table + " " + sqlStr(n.Key) + " " + sqlStr(n.Value)
+	case *KVGetStmt:
+		return "kv get " + n.Table + " " + sqlStr(n.Key)
+	case *KVDeleteStmt:
+		return "kv delete " + n.Table + " " + sqlStr(n.Key)
+	case *KVScanStmt:
+		s := "kv scan " + n.Table
+		if n.HasStart {
+			s += " " + sqlStr(n.Start)
+		}
+		if n.HasEnd {
+			s += " " + sqlStr(n.End)
+		}
+		return s
 	}
 	return ""
+}
+
+// sqlStr renders a raw byte string as a SQL string literal.
+func sqlStr(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func createTableString(n *CreateTableStmt) string {
@@ -94,6 +114,12 @@ func createTableString(n *CreateTableStmt) string {
 	sb.WriteString(")")
 	if len(n.PK) > 0 {
 		sb.WriteString(" primary key (" + strings.Join(n.PK, ", ") + ")")
+	}
+	if n.Engine != "" {
+		sb.WriteString(" engine=" + strings.ToUpper(n.Engine))
+	}
+	if n.Retention > 0 {
+		sb.WriteString(" retention='" + n.Retention.String() + "'")
 	}
 	return sb.String()
 }

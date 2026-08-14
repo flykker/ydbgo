@@ -7,8 +7,8 @@
 /data*/
 /n*/
 
-# bbolt + raft state (already under data dirs, kept here for safety)
-*.bbolt
+# pebble + raft state (already under data dirs, kept here for safety)
+*.pebble
 /raft/
 /stable
 

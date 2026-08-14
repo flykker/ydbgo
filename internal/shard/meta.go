@@ -98,7 +98,7 @@ type MetaCommand struct {
 
 // MetaFSM is the raft.FSM that owns the catalog.
 type MetaFSM struct {
-	mu  sync.Mutex
+	mu  sync.RWMutex
 	cat *Catalog
 	dir string
 }
@@ -115,11 +115,14 @@ func NewMetaFSM(dir string) *MetaFSM {
 	return f
 }
 
-// Catalog returns the current catalog.
+// Catalog returns the current catalog. The returned object is immutable:
+// every Apply builds a fresh catalog copy, so readers never observe a
+// mutating catalog and no serialization happens on the read path.
 func (f *MetaFSM) Catalog() *Catalog {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return cloneCatalog(f.cat)
+	f.mu.RLock()
+	c := f.cat
+	f.mu.RUnlock()
+	return c
 }
 
 func (f *MetaFSM) Apply(l *raft.Log) interface{} {
@@ -129,10 +132,12 @@ func (f *MetaFSM) Apply(l *raft.Log) interface{} {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := applyCommand(f.cat, &cmd); err != nil {
+	next := cloneCatalog(f.cat)
+	if err := applyCommand(next, &cmd); err != nil {
 		return err
 	}
-	f.cat.Version++
+	next.Version++
+	f.cat = next
 	if err := f.persist(); err != nil {
 		return err
 	}

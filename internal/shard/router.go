@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ydbgo/internal/proto"
@@ -268,19 +269,24 @@ func (m *Manager) handleExecShard(req *proto.Request) *proto.Response {
 	return &proto.Response{ID: req.ID, OK: true, Result: payloadOf(r)}
 }
 
-// handleScanShard returns all rows of one shard (for SELECT scatter).
+// handleScanShard returns the rows of one shard for a (possibly projected or
+// WHERE-restricted) SELECT pushed down for scatter.
+// Syntax: ADMIN SCAN-SHARD <table> <shard-id> [<sql...>]
 func (m *Manager) handleScanShard(req *proto.Request) *proto.Response {
 	fields := strings.Fields(req.SQL)
-	if len(fields) != 4 {
-		return fail(req, errors.New("usage: ADMIN SCAN-SHARD <table> <shard-id>"))
+	if len(fields) < 4 {
+		return fail(req, errors.New("usage: ADMIN SCAN-SHARD <table> <shard-id> [sql]"))
 	}
 	table, shardID := fields[2], fields[3]
-	_ = table
 	sh := m.localShard(shardID)
 	if sh == nil {
 		return fail(req, fmt.Errorf("shard %s not mounted locally", shardID))
 	}
-	r, err := sh.node.Execute("SELECT * FROM " + table)
+	sql := "SELECT * FROM " + table
+	if len(fields) > 4 {
+		sql = strings.TrimSpace(strings.TrimPrefix(req.SQL, "ADMIN SCAN-SHARD "+table+" "+shardID))
+	}
+	r, err := sh.node.Execute(sql)
 	if err != nil {
 		return fail(req, err)
 	}
@@ -435,7 +441,19 @@ func normalizeSchema(st *sqlx.CreateTableStmt) *sqlx.TableSchema {
 			pk = append(pk, c.Name)
 		}
 	}
-	return &sqlx.TableSchema{Name: st.Name, Columns: cols, PK: pk}
+	return &sqlx.TableSchema{Name: st.Name, Columns: cols, PK: pk, Engine: normalizeEngine(st.Engine), Retention: st.Retention}
+}
+
+// normalizeEngine mirrors sql.engineOf to uppercase canonical engine names.
+func normalizeEngine(e string) string {
+	switch e {
+	case "kv":
+		return "KV"
+	case "cstore":
+		return "CSTORE"
+	default:
+		return "TABLE"
+	}
 }
 
 // orchestrateMounts tells each placement node to mount its copy of the shard
@@ -564,16 +582,36 @@ func (m *Manager) execInsert(st *sqlx.InsertStmt) (*sqlx.Result, error) {
 		byShard[spec] = append(byShard[spec], row)
 	}
 	affected := int64(0)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
 	for _, spec := range order {
-		batch := &sqlx.InsertStmt{Table: st.Table, Columns: st.Columns, Rows: byShard[spec]}
-		resp, err := m.execShardSQL(spec, sqlx.StatementString(batch))
-		if err != nil {
-			return nil, err
-		}
-		if !resp.OK {
-			return nil, errors.New(resp.Error)
-		}
-		affected += int64(len(batch.Rows))
+		wg.Add(1)
+		go func(spec *ShardSpec, rows [][]sqlx.Expr) {
+			defer wg.Done()
+			batch := &sqlx.InsertStmt{Table: st.Table, Columns: st.Columns, Rows: rows}
+			resp, err := m.execShardSQL(spec, sqlx.StatementString(batch))
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			if err == nil && !resp.OK {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = errors.New(resp.Error)
+				}
+				mu.Unlock()
+				return
+			}
+			if err == nil && resp.Result != nil {
+				mu.Lock()
+				affected += resp.Result.Affected
+				mu.Unlock()
+			}
+		}(spec, byShard[spec])
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return &sqlx.Result{Type: "insert", Affected: affected}, nil
 }
@@ -661,28 +699,268 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 	}
 	u := &unionEngine{manager: m, spec: ts}
 	seen := map[string]bool{}
+	// For CSTORE tables push a projected SELECT down to each shard so shard
+	// nodes run columnar scans over only the columns the query touches.
+	var proj []string
+	if ts.Schema.Engine == "CSTORE" {
+		if cols, full := sqlx.ProjectionColumns(ts.Schema, st); !full {
+			proj = cols
+		}
+	}
+	// Derive a PK range from WHERE: skip shards that cannot contain matching
+	// rows and let each shard-local scan prune to the range.
+	rng, rngExact := sqlx.PKRangeFromWhere(ts.Schema, st.Where)
+	plLower, plUpper := storage.PKRangeBytes(rng)
+	whereSQL := ""
+	if st.Where != nil {
+		whereSQL = " WHERE " + sqlx.ExprString(st.Where)
+	}
 	// scan narrowest (hottest) shards first so their values win on overlap
 	shards := make([]*ShardSpec, len(ts.Shards))
 	copy(shards, ts.Shards)
 	sort.SliceStable(shards, func(i, j int) bool { return bytes.Compare(shards[i].Start, shards[j].Start) > 0 })
-	for _, spec := range shards {
-		rows, err := m.scanShard(spec)
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range rows {
-			k, err := pkKeyForRowValues(ts.Schema, r)
+	// skipShard reports whether a shard's whole range is disjoint from the
+	// query's PK range, in which case it cannot contain matching rows.
+	skipShard := func(spec *ShardSpec) bool {
+		return (plLower != nil && len(spec.End) > 0 && bytes.Compare(spec.End, plLower) <= 0) ||
+			(plUpper != nil && len(spec.Start) > 0 && bytes.Compare(spec.Start, plUpper) >= 0)
+	}
+	// For CSTORE whole-table aggregate SELECTs push mergeable partial
+	// aggregates down to each shard and combine them: no rows cross the wire.
+	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || rngExact) {
+		if plan, ok := sqlx.PlanAggregate(st, ts.Schema); ok {
+			ptypes := plan.PartialTypes(ts.Schema)
+			partials, err := m.parallelShardRows(shards, func(spec *ShardSpec) bool { return skipShard(spec) }, func(spec *ShardSpec) ([]sqlx.Row, error) {
+				return m.scanShardTyped(spec, plan.ShardSQL(spec.Table, whereSQL), ptypes)
+			})
 			if err != nil {
 				return nil, err
 			}
+			row := plan.Merge(partials)
+			return &sqlx.Result{Type: "select", Columns: plan.Cols(), Rows: []sqlx.Row{row}, Affected: 1}, nil
+		}
+	}
+	// For CSTORE single-column GROUP BY push partial groups down to each shard
+	// and merge groups with equal keys: only group rows cross the wire.
+	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || rngExact) {
+		if plan, ok := sqlx.PlanGrouped(st, ts.Schema); ok {
+			ptypes := plan.PartialTypes(ts.Schema)
+			partials, err := m.parallelShardRows(shards, func(spec *ShardSpec) bool { return skipShard(spec) }, func(spec *ShardSpec) ([]sqlx.Row, error) {
+				return m.scanShardTyped(spec, plan.ShardSQL(spec.Table, whereSQL), ptypes)
+			})
+			if err != nil {
+				return nil, err
+			}
+			rows := plan.Merge(partials)
+			return &sqlx.Result{Type: "select", Columns: plan.Cols(), Rows: rows, Affected: int64(len(rows))}, nil
+		}
+	}
+	all, err := m.parallelShardRows(shards, func(spec *ShardSpec) bool { return skipShard(spec) }, func(spec *ShardSpec) ([]sqlx.Row, error) {
+		if proj != nil {
+			return m.scanShardProjected(spec, proj, whereSQL)
+		}
+		return m.scanShard(spec, "SELECT * FROM "+spec.Table+whereSQL)
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range all {
+		k, err := pkKeyForRowValues(ts.Schema, r)
+		if err != nil {
+			return nil, err
+		}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		u.rows = append(u.rows, r)
+	}
+	return sqlx.NewExecutor(u).Execute(st)
+}
+
+// parallelShardRows runs scan for every non-skipped shard concurrently and
+// returns the per-shard rows concatenated in shard order (deterministic).
+// skip reports shards to leave untouched; scan fetches rows from one shard.
+// The first error aborts the wait and is returned.
+func (m *Manager) parallelShardRows(shards []*ShardSpec, skip func(spec *ShardSpec) bool, scan func(spec *ShardSpec) ([]sqlx.Row, error)) ([]sqlx.Row, error) {
+	out := make([][]sqlx.Row, len(shards))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	for i, spec := range shards {
+		if skip(spec) {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, spec *ShardSpec) {
+			defer wg.Done()
+			rows, err := scan(spec)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				return
+			}
+			out[i] = rows
+		}(i, spec)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	var all []sqlx.Row
+	for i := range shards {
+		if out[i] != nil {
+			all = append(all, out[i]...)
+		}
+	}
+	return all, nil
+}
+
+// --- raw KV (ENGINE=KV) routing ---
+
+// kvTableErr reminds users that raw KV ops need the KV engine table.
+func kvTableErr(table string) error {
+	return fmt.Errorf("table %q is not an ENGINE=KV table", table)
+}
+
+// kvShardForKey returns the shard that owns a raw byte key (byte-order ranges).
+func (m *Manager) kvShardForKey(table, key string) (*ShardSpec, error) {
+	ts := m.table(table)
+	if ts == nil {
+		return nil, notFound(table)
+	}
+	spec := m.owningShard(table, key)
+	if spec == nil {
+		return nil, fmt.Errorf("no shard owns key for table %q", table)
+	}
+	return spec, nil
+}
+
+func (m *Manager) execKVPut(st *sqlx.KVPutStmt) (*sqlx.Result, error) {
+	spec, err := m.kvShardForKey(st.Table, st.Key)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := m.execShardSQL(spec, sqlx.StatementString(st))
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, errors.New(resp.Error)
+	}
+	return &sqlx.Result{Type: "kv_put", Affected: 1}, nil
+}
+
+func (m *Manager) execKVDelete(st *sqlx.KVDeleteStmt) (*sqlx.Result, error) {
+	spec, err := m.kvShardForKey(st.Table, st.Key)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := m.execShardSQL(spec, sqlx.StatementString(st))
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, errors.New(resp.Error)
+	}
+	return &sqlx.Result{Type: "kv_delete", Affected: 1}, nil
+}
+
+func (m *Manager) execKVGet(st *sqlx.KVGetStmt) (*sqlx.Result, error) {
+	spec, err := m.kvShardForKey(st.Table, st.Key)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := m.execShardSQL(spec, sqlx.StatementString(st))
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, errors.New(resp.Error)
+	}
+	return resultFromPayload(resp.Result), nil
+}
+
+// execKVScan broadcasts a raw byte-key scan to every shard of a KV table and
+// merges results (byte order), deduplicating overlapping ranges from splits.
+func (m *Manager) execKVScan(st *sqlx.KVScanStmt) (*sqlx.Result, error) {
+	ts := m.table(st.Table)
+	if ts == nil {
+		return nil, notFound(st.Table)
+	}
+	var out []*proto.ResultPayload
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var firstErr error
+	for _, spec := range ts.Shards {
+		wg.Add(1)
+		go func(spec *ShardSpec) {
+			defer wg.Done()
+			resp, err := m.execShardSQL(spec, sqlx.StatementString(st))
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			if !resp.OK {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = errors.New(resp.Error)
+				}
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			if resp.Result != nil {
+				out = append(out, resp.Result)
+			}
+			mu.Unlock()
+		}(spec)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	seen := map[string]bool{}
+	var rows []sqlx.Row
+	for _, p := range out {
+		for _, r := range p.Rows {
+			if len(r) < 2 {
+				continue
+			}
+			k := r[0]
 			if seen[k] {
 				continue
 			}
 			seen[k] = true
-			u.rows = append(u.rows, r)
+			rows = append(rows, sqlx.Row{sqlx.StrValue(k), sqlx.StrValue(r[1])})
 		}
 	}
-	return sqlx.NewExecutor(u).Execute(st)
+	sort.Slice(rows, func(i, j int) bool { return rows[i][0].Str < rows[j][0].Str })
+	return &sqlx.Result{Type: "kv_scan", Columns: []string{"key", "value"}, Rows: rows, Affected: int64(len(rows))}, nil
+}
+
+// resultFromPayload rebuilds a sqlx.Result from a wire payload.
+func resultFromPayload(p *proto.ResultPayload) *sqlx.Result {
+	if p == nil {
+		return &sqlx.Result{Type: "ok"}
+	}
+	r := &sqlx.Result{Type: p.Type, Affected: p.Affected, Columns: p.Columns}
+	r.Rows = make([]sqlx.Row, len(p.Rows))
+	for i, sr := range p.Rows {
+		row := make(sqlx.Row, len(sr))
+		for j, s := range sr {
+			row[j] = sqlx.StrValue(s)
+		}
+		r.Rows[i] = row
+	}
+	return r
 }
 
 // --- key helpers ---
@@ -815,6 +1093,9 @@ func (u *unionEngine) Update(string, []sqlx.Value, map[string]sqlx.Value) error 
 	return errors.New("read-only")
 }
 func (u *unionEngine) Delete(string, []sqlx.Value) error { return errors.New("read-only") }
+func (u *unionEngine) DeleteRange(string, *sqlx.PKRange) (int64, error) {
+	return 0, errors.New("read-only")
+}
 
 type emptyEngine struct{}
 
@@ -827,6 +1108,9 @@ func (emptyEngine) Update(string, []sqlx.Value, map[string]sqlx.Value) error {
 	return errors.New("read-only")
 }
 func (emptyEngine) Delete(string, []sqlx.Value) error { return errors.New("read-only") }
+func (emptyEngine) DeleteRange(string, *sqlx.PKRange) (int64, error) {
+	return 0, errors.New("read-only")
+}
 
 // rowsFromPayload converts SCAN-SHARD string rows back into typed values.
 func rowsFromPayload(p *proto.ResultPayload, schema *sqlx.TableSchema) []sqlx.Row {
@@ -844,6 +1128,24 @@ func rowsFromPayload(p *proto.ResultPayload, schema *sqlx.TableSchema) []sqlx.Ro
 				continue
 			}
 			row[i] = valueFromString(c.Type, sr[ci])
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// rowsFromPayloadTyped reconstructs SCAN-SHARD string rows with the given
+// per-column types, for results that do not match the table schema.
+func rowsFromPayloadTyped(p *proto.ResultPayload, types []sqlx.Type) []sqlx.Row {
+	var out []sqlx.Row
+	for _, sr := range p.Rows {
+		row := make(sqlx.Row, len(types))
+		for i, t := range types {
+			if i >= len(sr) {
+				row[i] = sqlx.NullValue
+				continue
+			}
+			row[i] = valueFromString(t, sr[i])
 		}
 		out = append(out, row)
 	}
