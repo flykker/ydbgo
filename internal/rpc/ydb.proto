@@ -1,0 +1,48 @@
+// gRPC wire protocol for ydbsql: the single SQL/ADMIN transport between
+// clients, the shard manager, and cross-node forwarding.
+syntax = "proto3";
+
+package ydbgo;
+
+option go_package = "ydbgo/internal/rpc;rpc";
+
+// ResultPayload is the outcome of a statement.
+message ResultPayload {
+  string type = 1;
+  repeated string columns = 2;
+  repeated Row rows = 3; // []string rows as byte-packed fields (see Row)
+  int64 affected = 4;
+  string note = 5; // aux data (e.g. shard advertise addr)
+  int64 exec_ms = 6;
+}
+
+// Row is one result row: values are flattened and may contain arbitrary
+// bytes (e.g. encoded primary keys / shard range bounds), hence []byte.
+message Row {
+  repeated bytes values = 1;
+}
+
+// Request is a single SQL (or ADMIN) request.
+message Request {
+  int64 id = 1;
+  string sql = 2;
+}
+
+// Response is a server reply.
+message Response {
+  int64 id = 1;
+  bool ok = 2;
+  string error = 3;
+  ResultPayload result = 4;
+}
+
+// YdbService is the query endpoint served by every ydbgo node.
+service YdbService {
+  // Execute is a single request/response (used by one-shot clients).
+  rpc Execute(Request) returns (Response);
+
+  // Stream is a bidirectional stream for hot clients: requests and responses
+  // are matched by Request.id over one persistent HTTP/2 connection, avoiding
+  // per-call stream setup.
+  rpc Stream(stream Request) returns (stream Response);
+}
