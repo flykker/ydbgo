@@ -26,6 +26,16 @@ type GroupAgg struct {
 	Aggs []string // "count","sum","min","max","avg" (one entry per select item)
 }
 
+// ColumnFilter is a single-column predicate pushed into a columnar scan, so
+// only rows whose predicate column matches are materialized/aggregated. Op is
+// "=" or "LIKE" (leading-literal prefix). Col is the schema column index and
+// Lit is the comparison literal normalized to the column type.
+type ColumnFilter struct {
+	Col int
+	Op  string // "=" or "LIKE"
+	Lit Value  // for "=": the literal; for "LIKE": the leading literal run
+}
+
 // ColumnEngine is an optional columnar capability implemented by CSTORE
 // tables. It lets the executor project only the columns a SELECT touches, push
 // whole-table aggregates down to the store (avoiding row reconstruction) and
@@ -49,6 +59,22 @@ type ColumnEngine interface {
 	// aggregate results of gas in order]. All the aggregate columns are read
 	// in one scan each (columns shared by several gas are read once).
 	ColumnGroupedAggregates(table string, groupCol int, gas []GroupAgg, r *PKRange) ([]Row, error)
+	// ScanTopN returns up to limit rows with only colIdx materialized, ordered
+	// by primary key (descending when desc is true). The scan walks the PK
+	// index in index order and stops after limit live rows, so it is O(limit).
+	ScanTopN(table string, colIdx []int, r *PKRange, desc bool, limit int) ([]Row, error)
+	// ColumnCountFiltered counts rows whose predicate column cell matches pred,
+	// within the PK range r. The predicate is evaluated columnar, so no rows
+	// are materialized.
+	ColumnCountFiltered(table string, pred *ColumnFilter, r *PKRange) (int64, error)
+	// ColumnAggregatesFiltered computes whole-table aggregates over one column,
+	// restricted to rows whose predicate column cell matches pred, in a single
+	// columnar scan.
+	ColumnAggregatesFiltered(table string, colIdx int, aggs []string, pred *ColumnFilter, r *PKRange) ([]Value, error)
+	// ScanColumnsFiltered returns every row whose predicate column cell matches
+	// pred, with only the given columns materialized. Rows are full-width and
+	// ordered like ScanColumns.
+	ScanColumnsFiltered(table string, colIdx []int, pred *ColumnFilter, r *PKRange) ([]Row, error)
 }
 
 // rowsFor fetches the rows of a SELECT. For CSTORE tables it materializes only
@@ -59,7 +85,7 @@ func (ex *Executor) rowsFor(s *SelectStmt, schema *TableSchema) ([]Row, error) {
 	if schema == nil || schema.Engine != "CSTORE" || ce == nil {
 		return ex.Eng.Scan(s.From)
 	}
-	rng, _ := PKRangeFromWhere(schema, s.Where)
+	rng, pred, _ := PlanWhere(schema, s.Where)
 	idx, full := neededColumnIndexes(schema, s)
 	if full {
 		idx = make([]int, len(schema.Columns))
@@ -67,22 +93,27 @@ func (ex *Executor) rowsFor(s *SelectStmt, schema *TableSchema) ([]Row, error) {
 			idx[i] = i
 		}
 	}
+	if pred != nil {
+		return ce.ScanColumnsFiltered(s.From, idx, pred, rng)
+	}
 	return ce.ScanColumns(s.From, idx, rng)
 }
 
 // aggregatePushdown computes whole-table aggregates directly in the columnar
 // store when a SELECT is a pure aggregate (no GROUP BY / ORDER BY / LIMIT; no
-// WHERE, or a WHERE fully consumed as a primary-key range). Aggregates over
-// the same column are combined into one columnar scan.
+// WHERE, or a WHERE fully consumed as a primary-key range plus at most one
+// non-PK predicate). Aggregates over the same column are combined into one
+// columnar scan.
 func (ex *Executor) aggregatePushdown(s *SelectStmt, schema *TableSchema) (*Result, bool, error) {
 	if schema == nil || schema.Engine != "CSTORE" ||
 		len(s.GroupBy) > 0 || len(s.OrderBy) > 0 || s.HasLimit {
 		return nil, false, nil
 	}
 	var rng *PKRange
+	var pred *ColumnFilter
 	if s.Where != nil {
 		var exact bool
-		rng, exact = PKRangeFromWhere(schema, s.Where)
+		rng, pred, exact = PlanWhere(schema, s.Where)
 		if !exact {
 			return nil, false, nil
 		}
@@ -138,7 +169,13 @@ func (ex *Executor) aggregatePushdown(s *SelectStmt, schema *TableSchema) (*Resu
 	var colOrder []int
 	for _, ia := range itemAggs {
 		if ia.star {
-			n, err := ce.ColumnCount(s.From, rng)
+			var n int64
+			var err error
+			if pred != nil {
+				n, err = ce.ColumnCountFiltered(s.From, pred, rng)
+			} else {
+				n, err = ce.ColumnCount(s.From, rng)
+			}
 			if err != nil {
 				return nil, false, err
 			}
@@ -157,7 +194,13 @@ func (ex *Executor) aggregatePushdown(s *SelectStmt, schema *TableSchema) (*Resu
 		for j, ia := range group {
 			aggs[j] = ia.agg
 		}
-		vals, err := ce.ColumnAggregates(s.From, ci, aggs, rng)
+		var vals []Value
+		var err error
+		if pred != nil {
+			vals, err = ce.ColumnAggregatesFiltered(s.From, ci, aggs, pred, rng)
+		} else {
+			vals, err = ce.ColumnAggregates(s.From, ci, aggs, rng)
+		}
 		if err != nil {
 			return nil, false, err
 		}
@@ -848,6 +891,149 @@ func appendPrefix(prefix []Value, v Value) []Value {
 	return out
 }
 
+// PlanWhere decomposes a WHERE clause into a primary-key range plus at most
+// one single-column predicate (a non-PK column compared by equality or a
+// leading-literal LIKE prefix against a constant). exact reports whether the
+// WHERE is fully characterized by the returned range and predicate, so no
+// residual per-row filter is needed (safe for whole-table aggregate/grouped
+// pushdown). The range is always a superset of the matching rows; pred (if
+// any) is applied columnar on top of it.
+func PlanWhere(schema *TableSchema, where Expr) (rng *PKRange, pred *ColumnFilter, exact bool) {
+	if schema == nil || len(schema.PK) == 0 {
+		return nil, nil, where == nil
+	}
+	pos := make(map[string]int, len(schema.Columns))
+	colTypes := make(map[string]Type, len(schema.Columns))
+	for i, c := range schema.Columns {
+		pos[c.Name] = i
+		colTypes[c.Name] = c.Type
+	}
+	pkSet := make(map[string]bool, len(schema.PK))
+	for _, p := range schema.PK {
+		pkSet[p] = true
+	}
+	var pkLeaves []Expr
+	var predVal *ColumnFilter
+	exact = true
+	var visit func(e Expr)
+	visit = func(e Expr) {
+		bin, ok := e.(*BinaryOp)
+		if !ok {
+			exact = false
+			return
+		}
+		op := strings.ToUpper(bin.Op)
+		if op == "AND" {
+			visit(bin.Left)
+			visit(bin.Right)
+			return
+		}
+		if op == "OR" {
+			exact = false
+			return
+		}
+		var id *Ident
+		var lit *Literal
+		switch l := bin.Left.(type) {
+		case *Ident:
+			if r, ok := bin.Right.(*Literal); ok {
+				id, lit = l, r
+			}
+		case *Literal:
+			if r, ok := bin.Right.(*Ident); ok {
+				id, lit = r, l
+			}
+		}
+		if id == nil || lit == nil {
+			exact = false
+			return
+		}
+		// PK-column leaves are handed to PKRangeFromWhere, which folds them
+		// into the range (and reports its own exactness).
+		if pkSet[id.Name] {
+			pkLeaves = append(pkLeaves, e)
+			return
+		}
+		ci, isCol := pos[id.Name]
+		if !isCol {
+			exact = false
+			return
+		}
+		v, err := Eval(lit, nil)
+		if err != nil || v.Null {
+			exact = false
+			return
+		}
+		ct := colTypes[id.Name]
+		if ct != TypeNull && v.Type != ct {
+			converted, cerr := Convert(v, ct)
+			if cerr != nil {
+				exact = false
+				return
+			}
+			v = converted
+		}
+		var p *ColumnFilter
+		switch op {
+		case "=":
+			p = &ColumnFilter{Col: ci, Op: "=", Lit: v}
+		case "LIKE":
+			if ct != TypeString || lit.Type != TypeString {
+				exact = false
+				return
+			}
+			pat := lit.Str
+			wi := -1
+			for i := 0; i < len(pat); i++ {
+				if pat[i] == '%' || pat[i] == '_' {
+					wi = i
+					break
+				}
+			}
+			if wi < 0 {
+				p = &ColumnFilter{Col: ci, Op: "=", Lit: StrValue(pat)}
+			} else if wi > 0 && pat[wi:] == "%" {
+				p = &ColumnFilter{Col: ci, Op: "LIKE", Lit: StrValue(pat[:wi])}
+			} else {
+				exact = false // leading or mid-pattern wildcard: cannot fold
+				return
+			}
+		default:
+			exact = false
+			return
+		}
+		if predVal != nil && (predVal.Col != ci || predVal.Op != p.Op) {
+			exact = false // more than one distinct non-PK predicate
+			return
+		}
+		predVal = p
+	}
+	visit(where)
+	if !exact {
+		return nil, nil, false
+	}
+	if len(pkLeaves) > 0 {
+		var pkExact bool
+		rng, pkExact = PKRangeFromWhere(schema, andExprs(pkLeaves))
+		if !pkExact {
+			return nil, nil, false
+		}
+	}
+	return rng, predVal, true
+}
+
+// andExprs folds a list of expressions into a left-deep AND chain.
+func andExprs(es []Expr) Expr {
+	if len(es) == 0 {
+		return nil
+	}
+	e := es[0]
+	for _, x := range es[1:] {
+		e = &BinaryOp{Op: "AND", Left: e, Right: x}
+	}
+	return e
+}
+
 // successor returns the smallest byte-lexicographic string strictly greater
 // than s: the last non-0xff byte is incremented, or a 0x00 byte is appended
 // when every byte is 0xff. Used to build the exclusive upper bound of a
@@ -964,4 +1150,103 @@ func ProjectionColumns(schema *TableSchema, s *SelectStmt) ([]string, bool) {
 		return nil, true
 	}
 	return cols, false
+}
+
+// expandSelectItems expands a "*" select item into per-column items. A
+// wildcard with no schema stays a literal "*" item.
+func expandSelectItems(s *SelectStmt, schema *TableSchema) []*SelectItem {
+	var cols []*SelectItem
+	starIdx := -1
+	for i, it := range s.Items {
+		if id, ok := it.Expr.(*Ident); ok && id.Name == "*" && schema != nil {
+			starIdx = i
+			continue
+		}
+		cols = append(cols, it)
+	}
+	if starIdx >= 0 && schema != nil {
+		for _, c := range schema.Columns {
+			cols = append(cols, &SelectItem{Expr: &Ident{Name: c.Name}})
+		}
+	} else if starIdx >= 0 {
+		cols = append(cols, &SelectItem{Expr: &Ident{Name: "*"}})
+	}
+	return cols
+}
+
+// PlanTopN reports whether a SELECT can be answered by taking the top LIMIT
+// rows per shard ordered by the primary key and merging them. It requires the
+// ORDER BY to sort exactly by the PK columns in one direction, a LIMIT, and no
+// GROUP BY / aggregates / DISTINCT. It returns the PK column list, direction
+// and limit.
+func PlanTopN(s *SelectStmt, schema *TableSchema) (pk []string, desc bool, limit int64, ok bool) {
+	if schema == nil || schema.Engine != "CSTORE" || len(s.GroupBy) > 0 || s.Distinct || !s.HasLimit {
+		return nil, false, 0, false
+	}
+	for _, it := range s.Items {
+		if isAggregate(it.Expr) {
+			return nil, false, 0, false
+		}
+	}
+	pk = pkIndex(schema)
+	if len(pk) == 0 || len(s.OrderBy) != len(pk) {
+		return nil, false, 0, false
+	}
+	desc = s.OrderBy[0].Desc
+	for i, o := range s.OrderBy {
+		id, isIdent := o.Expr.(*Ident)
+		if !isIdent || id.Name != pk[i] || o.Desc != desc {
+			return nil, false, 0, false
+		}
+	}
+	return pk, desc, s.Limit, true
+}
+
+// topNPushdown answers an ORDER BY PK ... LIMIT SELECT directly from the
+// columnar store: ScanTopN returns the top rows in index order, so neither a
+// full scan nor a sort is needed. Returns a result only when the pattern
+// applies (and WHERE, if any, is fully consumed as a PK range).
+func (ex *Executor) topNPushdown(s *SelectStmt, schema *TableSchema) (*Result, bool, error) {
+	_, desc, limit, ok := PlanTopN(s, schema)
+	if !ok {
+		return nil, false, nil
+	}
+	var rng *PKRange
+	if s.Where != nil {
+		var exact bool
+		rng, exact = PKRangeFromWhere(schema, s.Where)
+		if !exact {
+			return nil, false, nil
+		}
+	}
+	ce, ok := ex.Eng.(ColumnEngine)
+	if !ok {
+		return nil, false, nil
+	}
+	idx, full := neededColumnIndexes(schema, s)
+	if full {
+		idx = make([]int, len(schema.Columns))
+		for i := range schema.Columns {
+			idx[i] = i
+		}
+	}
+	rows, err := ce.ScanTopN(s.From, idx, rng, desc, int(limit))
+	if err != nil {
+		return nil, false, err
+	}
+	cols := expandSelectItems(s, schema)
+	out := make([]Row, 0, len(rows))
+	for _, r := range rows {
+		ctx := rowContext(schema, r)
+		outRow := make(Row, len(cols))
+		for i, it := range cols {
+			v, err := Eval(it.Expr, ctx)
+			if err != nil {
+				return nil, false, err
+			}
+			outRow[i] = v
+		}
+		out = append(out, outRow)
+	}
+	return &Result{Type: "select", Columns: resultColumns(cols), Rows: out, Affected: int64(len(out))}, true, nil
 }

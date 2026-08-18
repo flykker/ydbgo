@@ -39,6 +39,20 @@ type KVEngine interface {
 	KVScan(table string, start, end string) ([]KVEntry, error)
 }
 
+// IndexEngine is the optional secondary-index surface of a storage engine.
+// Engines that cannot build indexes (union/empty engines used for sharded
+// scatter) do not implement it and index DDL fails cleanly.
+type IndexEngine interface {
+	CreateIndex(table, name string, cols []string, ifNotExists bool) error
+	DropIndex(table, name string, ifExists bool) error
+}
+
+// BatchInsertEngine is an optional engine capability: inserting many rows of
+// one table inside a single transaction (one write lock, one store commit).
+type BatchInsertEngine interface {
+	BatchInsert(table string, rows []map[string]Value) (int64, error)
+}
+
 // KVEntry is one raw key/value pair returned by a KV SCAN.
 type KVEntry struct {
 	Key   string
@@ -68,9 +82,9 @@ func (ex *Executor) Execute(st Statement) (*Result, error) {
 	case *DropTableStmt:
 		return ex.execDropTable(s)
 	case *CreateIndexStmt:
-		return &Result{Type: "create_index"}, nil
+		return ex.execCreateIndex(s)
 	case *DropIndexStmt:
-		return &Result{Type: "drop_index"}, nil
+		return ex.execDropIndex(s)
 	case *InsertStmt:
 		return ex.execInsert(s)
 	case *UpdateStmt:
@@ -105,6 +119,36 @@ func (ex *Executor) kvEngine() (KVEngine, error) {
 		return nil, &ExecError{Msg: "engine does not support raw KV operations"}
 	}
 	return ke, nil
+}
+
+func (ex *Executor) indexEngine() (IndexEngine, error) {
+	ie, ok := ex.Eng.(IndexEngine)
+	if !ok {
+		return nil, &ExecError{Msg: "engine does not support secondary indexes"}
+	}
+	return ie, nil
+}
+
+func (ex *Executor) execCreateIndex(s *CreateIndexStmt) (*Result, error) {
+	ie, err := ex.indexEngine()
+	if err != nil {
+		return nil, err
+	}
+	if err := ie.CreateIndex(s.Table, s.Name, s.Columns, s.IfNotExists); err != nil {
+		return nil, err
+	}
+	return &Result{Type: "create_index", Affected: 1}, nil
+}
+
+func (ex *Executor) execDropIndex(s *DropIndexStmt) (*Result, error) {
+	ie, err := ex.indexEngine()
+	if err != nil {
+		return nil, err
+	}
+	if err := ie.DropIndex(s.Table, s.Name, s.IfExists); err != nil {
+		return nil, err
+	}
+	return &Result{Type: "drop_index", Affected: 1}, nil
 }
 
 func (ex *Executor) execKVPut(s *KVPutStmt) (*Result, error) {
@@ -243,7 +287,7 @@ func (ex *Executor) execInsert(s *InsertStmt) (*Result, error) {
 			colIndex[c] = i
 		}
 	}
-	affected := int64(0)
+	rows := make([]map[string]Value, 0, len(s.Rows))
 	for _, row := range s.Rows {
 		if len(row) < len(colIndex) {
 			return nil, &ExecError{Msg: "row has fewer values than columns"}
@@ -268,6 +312,18 @@ func (ex *Executor) execInsert(s *InsertStmt) (*Result, error) {
 				return nil, &ExecError{Msg: "column " + c.Name + " is not null"}
 			}
 		}
+		rows = append(rows, vals)
+	}
+	// Batch path: normalize once, insert everything in one transaction.
+	if be, ok := ex.Eng.(BatchInsertEngine); ok {
+		affected, err := be.BatchInsert(s.Table, rows)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{Type: "insert", Affected: affected}, nil
+	}
+	affected := int64(0)
+	for _, vals := range rows {
 		if err := ex.Eng.Insert(s.Table, vals); err != nil {
 			return nil, err
 		}
@@ -409,6 +465,12 @@ func (ex *Executor) execSelect(s *SelectStmt) (*Result, error) {
 			return r, nil
 		}
 	}
+	// ORDER BY PK + LIMIT: top-N straight from the PK index, no full scan/sort
+	if r, ok, err := ex.topNPushdown(s, schema); err != nil {
+		return nil, err
+	} else if ok {
+		return r, nil
+	}
 	var rows []Row
 	if s.From != "" {
 		var err error
@@ -480,22 +542,7 @@ func (ex *Executor) execSelect(s *SelectStmt) (*Result, error) {
 		}
 	} else {
 		// expand * into per-column projections
-		var cols []*SelectItem
-		starIdx := -1
-		for i, it := range s.Items {
-			if id, ok := it.Expr.(*Ident); ok && id.Name == "*" && schema != nil {
-				starIdx = i
-				continue
-			}
-			cols = append(cols, it)
-		}
-		if starIdx >= 0 && schema != nil {
-			for _, c := range schema.Columns {
-				cols = append(cols, &SelectItem{Expr: &Ident{Name: c.Name}})
-			}
-		} else if starIdx >= 0 {
-			cols = append(cols, &SelectItem{Expr: &Ident{Name: "*"}})
-		}
+		cols := expandSelectItems(s, schema)
 		for _, ctx := range contexts {
 			row := make(Row, len(cols))
 			for i, it := range cols {

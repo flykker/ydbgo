@@ -1,6 +1,7 @@
 package shard
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -89,4 +90,30 @@ func (m *metrics) report() string {
 		w, r,
 		float64(wp50)/1e6, float64(wp99)/1e6, wn,
 		float64(rp50)/1e6, float64(rp99)/1e6, rn)
+}
+
+// reportJSON returns the same metrics as a JSON string, for the UI backend.
+func (m *metrics) reportJSON() string {
+	m.mu.Lock()
+	w, r := m.writes, m.reads
+	m.mu.Unlock()
+	wp50, wn := m.writHist.percentile(0.50)
+	wp99, _ := m.writHist.percentile(0.99)
+	rp50, rn := m.readHist.percentile(0.50)
+	rp99, _ := m.readHist.percentile(0.99)
+	rep := map[string]interface{}{
+		"writes": w,
+		"reads":  r,
+		"write_latency_ms": map[string]interface{}{
+			"p50": float64(wp50) / 1e6, "p99": float64(wp99) / 1e6, "samples": wn,
+		},
+		"read_latency_ms": map[string]interface{}{
+			"p50": float64(rp50) / 1e6, "p99": float64(rp99) / 1e6, "samples": rn,
+		},
+	}
+	b, err := json.Marshal(rep)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }

@@ -123,6 +123,68 @@ func TestEnginePersistence(t *testing.T) {
 	}
 }
 
+func TestEngineBatchInsert(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	schema := &sqlx.TableSchema{
+		Name:    "t",
+		Columns: []sqlx.ColumnDef{{Name: "a", Type: sqlx.TypeInt}, {Name: "name", Type: sqlx.TypeString}, {Name: "age", Type: sqlx.TypeInt}},
+		PK:      []string{"a"},
+		Engine:  "CSTORE",
+	}
+	if err := e.CreateTable(schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CreateIndex("t", "ix_name", []string{"name"}, false); err != nil {
+		t.Fatal(err)
+	}
+	rows := make([]map[string]sqlx.Value, 0, 100)
+	for i := 0; i < 100; i++ {
+		rows = append(rows, map[string]sqlx.Value{
+			"a":    sqlx.IntValue(int64(i)),
+			"name": sqlx.StrValue(fmt.Sprintf("n%d", i%5)),
+			"age":  sqlx.IntValue(int64(i)),
+		})
+	}
+	n, err := e.BatchInsert("t", rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 100 {
+		t.Fatalf("affected=%d want 100", n)
+	}
+	scanned, err := e.Scan("t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanned) != 100 {
+		t.Fatalf("rows=%d want 100", len(scanned))
+	}
+	// Index entries were maintained by the batch.
+	cnt, err := e.ColumnCountFiltered("t", &sqlx.ColumnFilter{Col: 1, Op: "=", Lit: sqlx.StrValue("n2")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 20 {
+		t.Fatalf("n2 count=%d want 20", cnt)
+	}
+	// Overwrite within the batch keeps entries consistent.
+	for i := 0; i < 5; i++ {
+		rows[i] = map[string]sqlx.Value{"a": sqlx.IntValue(int64(i)), "name": sqlx.StrValue("x"), "age": sqlx.IntValue(0)}
+	}
+	if _, err := e.BatchInsert("t", rows[:5]); err != nil {
+		t.Fatal(err)
+	}
+	cnt, _ = e.ColumnCountFiltered("t", &sqlx.ColumnFilter{Col: 1, Op: "=", Lit: sqlx.StrValue("x")}, nil)
+	if cnt != 5 {
+		t.Fatalf("x count=%d want 5", cnt)
+	}
+	cnt, _ = e.ColumnCountFiltered("t", &sqlx.ColumnFilter{Col: 1, Op: "=", Lit: sqlx.StrValue("n0")}, nil)
+	if cnt != 19 {
+		t.Fatalf("n0 count=%d want 19", cnt)
+	}
+}
+
 func TestSQLEndToEnd(t *testing.T) {
 	e := newTestEngine(t)
 	defer e.Close()
@@ -164,6 +226,129 @@ func TestSQLEndToEnd(t *testing.T) {
 	if r.Rows[0][0].Int != 1 {
 		t.Errorf("count after delete=%v", r.Rows[0][0])
 	}
+}
+
+// TestBIFunctions exercises the BI-facing SQL functions used by dashboards:
+// time_bucket(interval, ts), COUNT_IF(cond) and NOW(), both standalone and in
+// grouped queries over a CSTORE table.
+func TestBIFunctions(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	ex := sqlx.NewExecutor(e)
+	execOK(t, ex, "CREATE TABLE logs (ts timestamp primary key, level string, lat double) ENGINE=CSTORE")
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 8; i++ {
+		ts := base.Add(time.Duration(i) * 30 * time.Minute)
+		level := "INFO"
+		if i%3 == 0 {
+			level = "ERROR"
+		}
+		execOK(t, ex, fmt.Sprintf("INSERT INTO logs VALUES ('%s', '%s', %d)",
+			ts.Format(time.RFC3339Nano), level, i*10))
+	}
+
+	// time_bucket standalone: bucket boundaries align to the interval.
+	r := execOK(t, ex, "SELECT time_bucket('2h', '2024-01-01T01:45:00Z')")
+	want := "2024-01-01T00:00:00Z"
+	if got := r.Rows[0][0].String(); got != want {
+		t.Errorf("time_bucket('2h') = %s, want %s", got, want)
+	}
+	// compound interval string and negative-epoch-adjacent times.
+	r = execOK(t, ex, "SELECT time_bucket('1h30m', '2024-01-01T01:45:00Z')")
+	if got := r.Rows[0][0].String(); got != "2024-01-01T01:30:00Z" {
+		t.Errorf("time_bucket('1h30m') = %s", got)
+	}
+	// numeric seconds interval.
+	r = execOK(t, ex, "SELECT time_bucket(3600, '2024-01-01T01:45:00Z')")
+	if got := r.Rows[0][0].String(); got != "2024-01-01T01:00:00Z" {
+		t.Errorf("time_bucket(3600) = %s", got)
+	}
+	// NOW() returns a timestamp; unixepoch returns an int.
+	if r = execOK(t, ex, "SELECT unixepoch()"); r.Rows[0][0].Type != sqlx.TypeInt {
+		t.Errorf("unixepoch type = %s", r.Rows[0][0].Type)
+	}
+
+	// COUNT_IF whole table: 8 rows, ERROR on i%3==0 -> i in {0,3,6} -> 3.
+	r = execOK(t, ex, "SELECT COUNT_IF(level = 'ERROR') FROM logs")
+	if r.Rows[0][0].Int != 3 {
+		t.Errorf("count_if errors = %d, want 3", r.Rows[0][0].Int)
+	}
+	// COUNT_IF over an empty window.
+	r = execOK(t, ex, "SELECT COUNT_IF(level = 'ERROR') FROM logs WHERE ts < '2023-01-01T00:00:00Z'")
+	if r.Rows[0][0].Int != 0 {
+		t.Errorf("count_if empty = %d, want 0", r.Rows[0][0].Int)
+	}
+
+	// Grouped by 2h bucket aligned to epoch: rows span 00:00..03:30Z -> exactly
+	// two buckets: 00:00Z (i=0..3) and 02:00Z (i=4..7), 4 rows each. ERROR on
+	// i%3==0 -> bucket 00:00Z has errors at i=0,3 (count 2), bucket 02:00Z has
+	// an error at i=6 (count 1).
+	r = execOK(t, ex, "SELECT time_bucket('2h', ts) AS b, COUNT(*) AS c, COUNT_IF(level = 'ERROR') AS e FROM logs GROUP BY time_bucket('2h', ts)")
+	got := map[string][]int64{}
+	for _, row := range r.Rows {
+		got[row[0].String()] = []int64{row[1].Int, row[2].Int}
+	}
+	wantBuckets := map[string][]int64{
+		"2024-01-01T00:00:00Z": {4, 2},
+		"2024-01-01T02:00:00Z": {4, 1},
+	}
+	if len(got) != len(wantBuckets) {
+		t.Fatalf("grouped buckets = %d, want %d (%v)", len(got), len(wantBuckets), got)
+	}
+	for b, w := range wantBuckets {
+		if g, ok := got[b]; !ok || g[0] != w[0] || g[1] != w[1] {
+			t.Errorf("bucket %s = %v, want %v", b, g, w)
+		}
+	}
+}
+
+func TestSQLIndexEndToEnd(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	ex := sqlx.NewExecutor(e)
+	execOK(t, ex, "CREATE TABLE users (id int64 primary key, name string, age int64) ENGINE=CSTORE")
+	execOK(t, ex, "INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 30), (3, 'Bobby', 35)")
+	execOK(t, ex, "CREATE INDEX ix_name ON users (name)")
+
+	r := execOK(t, ex, "SELECT id FROM users WHERE name = 'Bob'")
+	if len(r.Rows) != 1 || r.Rows[0][0].Int != 2 {
+		t.Errorf("eq rows=%v", r.Rows)
+	}
+	r = execOK(t, ex, "SELECT id FROM users WHERE name LIKE 'Bob%'")
+	if len(r.Rows) != 2 {
+		t.Errorf("like rows=%v", r.Rows)
+	}
+	r = execOK(t, ex, "SELECT COUNT(*) FROM users WHERE name = 'Alice'")
+	if r.Rows[0][0].Int != 1 {
+		t.Errorf("count=%v", r.Rows[0][0])
+	}
+
+	// DML keeps the index in sync.
+	execOK(t, ex, "UPDATE users SET name = 'Zed' WHERE name = 'Alice'")
+	r = execOK(t, ex, "SELECT id FROM users WHERE name = 'Alice'")
+	if len(r.Rows) != 0 {
+		t.Errorf("Alice after update=%v", r.Rows)
+	}
+	r = execOK(t, ex, "SELECT id FROM users WHERE name = 'Zed'")
+	if len(r.Rows) != 1 || r.Rows[0][0].Int != 1 {
+		t.Errorf("Zed rows=%v", r.Rows)
+	}
+	execOK(t, ex, "DELETE FROM users WHERE id = 2")
+	r = execOK(t, ex, "SELECT id FROM users WHERE name = 'Bob'")
+	if len(r.Rows) != 0 {
+		t.Errorf("Bob after delete=%v", r.Rows)
+	}
+
+	// Drop + IF EXISTS / IF NOT EXISTS handling.
+	execOK(t, ex, "DROP INDEX ix_name ON users")
+	r = execOK(t, ex, "SELECT COUNT(*) FROM users")
+	if r.Rows[0][0].Int != 2 {
+		t.Errorf("count after drop=%v", r.Rows[0][0])
+	}
+	execOK(t, ex, "CREATE INDEX IF NOT EXISTS ix_name ON users (name)")
+	execOK(t, ex, "CREATE INDEX IF NOT EXISTS ix_name ON users (name)")
+	execOK(t, ex, "DROP INDEX IF EXISTS ix_name ON users")
+	execOK(t, ex, "DROP INDEX IF EXISTS ix_name ON users")
 }
 
 func mustParse(t testing.TB, s string) []sqlx.Statement {
@@ -251,6 +436,137 @@ func TestEngineSnapshotRoundtrip(t *testing.T) {
 	}
 	if len(rows) != 2 {
 		t.Errorf("rows after reopen=%d", len(rows))
+	}
+}
+
+// TestEngineSnapshotPointInTime verifies CaptureSnapshot pins the exact state
+// at capture time: MarshalSnap after further writes must not see them, and the
+// captured data must remain fully restorable.
+func TestEngineSnapshotPointInTime(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	schema := &sqlx.TableSchema{
+		Name:    "t",
+		Engine:  "CSTORE",
+		Columns: []sqlx.ColumnDef{{Name: "a", Type: sqlx.TypeInt, AsPrimary: true}, {Name: "name", Type: sqlx.TypeString}},
+		PK:      []string{"a"},
+	}
+	if err := e.CreateTable(schema); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []int{1, 2} {
+		if err := e.Insert("t", map[string]sqlx.Value{"a": sqlx.IntValue(int64(a)), "name": sqlx.StrValue("pre" + string(rune('a'+a)))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap, err := e.CaptureSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Release()
+
+	// Writes after capture must be invisible to MarshalSnap.
+	for a := 3; a <= 6; a++ {
+		if err := e.Insert("t", map[string]sqlx.Value{"a": sqlx.IntValue(int64(a)), "name": sqlx.StrValue("post" + string(rune('a'+a)))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state, err := e.MarshalSnap(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir2 := filepath.Join(t.TempDir(), "db")
+	e2, err := Open(dir2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e2.Close()
+	if err := e2.ReplaceState(state); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := e2.Scan("t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("snapshot rows=%d, want 2 (post-capture writes leaked)", len(rows))
+	}
+
+	// A fresh capture reflects everything.
+	state2, err := e.MarshalState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e3, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e3.Close()
+	if err := e3.ReplaceState(state2); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = e3.Scan("t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 6 {
+		t.Fatalf("fresh snapshot rows=%d, want 6", len(rows))
+	}
+}
+
+// TestEngineSnapshotKVTable covers the ENGINE=KV snapshot path (raw byte-KV
+// entries serialized via kvTx.dataEach).
+func TestEngineSnapshotKVTable(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	schema := &sqlx.TableSchema{
+		Name:    "kv_t",
+		Engine:  "KV",
+		Columns: []sqlx.ColumnDef{{Name: "id", Type: sqlx.TypeInt, NotNull: true, AsPrimary: true}, {Name: "v", Type: sqlx.TypeString}},
+		PK:      []string{"id"},
+	}
+	if err := e.CreateTable(schema); err != nil {
+		t.Fatal(err)
+	}
+	for a := 1; a <= 4; a++ {
+		if err := e.Insert("kv_t", map[string]sqlx.Value{"id": sqlx.IntValue(int64(a)), "v": sqlx.StrValue("v" + string(rune('a'+a)))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap, err := e.CaptureSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Release()
+
+	if err := e.Insert("kv_t", map[string]sqlx.Value{"id": sqlx.IntValue(5), "v": sqlx.StrValue("vx")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Delete("kv_t", []sqlx.Value{sqlx.IntValue(1)}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := e.MarshalSnap(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e2.Close()
+	if err := e2.ReplaceState(state); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := e2.Scan("kv_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("snapshot kv rows=%d, want 4", len(rows))
 	}
 }
 
@@ -709,6 +1025,290 @@ func TestCStoreColumns(t *testing.T) {
 	}
 }
 
+// TestCStoreFilteredColumns exercises the predicate-pushdown surface
+// (sqlx.ColumnEngine): ColumnCountFiltered, ColumnAggregatesFiltered and
+// ScanColumnsFiltered, for both equality and leading-literal LIKE predicates.
+func TestCStoreFilteredColumns(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	schema := &sqlx.TableSchema{
+		Name:   "cs_t",
+		Engine: "CSTORE",
+		Columns: []sqlx.ColumnDef{
+			{Name: "id", Type: sqlx.TypeInt, NotNull: true, AsPrimary: true},
+			{Name: "v", Type: sqlx.TypeString},
+			{Name: "score", Type: sqlx.TypeInt},
+		},
+		PK: []string{"id"},
+	}
+	if err := e.CreateTable(schema); err != nil {
+		t.Fatal(err)
+	}
+	vals := []struct {
+		id    int64
+		v     string
+		score int64
+	}{
+		{1, "apple", 10},
+		{2, "apricot", 20},
+		{3, "banana", 30},
+		{4, "cherry", 40},
+	}
+	for _, r := range vals {
+		if err := e.Insert("cs_t", map[string]sqlx.Value{
+			"id": sqlx.IntValue(r.id), "v": sqlx.StrValue(r.v), "score": sqlx.IntValue(r.score),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// equality predicate on the string column: count + aggregate on another col
+	eq := &sqlx.ColumnFilter{Col: 1, Op: "=", Lit: sqlx.StrValue("banana")}
+	n, err := e.ColumnCountFiltered("cs_t", eq, nil)
+	if err != nil || n != 1 {
+		t.Fatalf("ColumnCountFiltered(eq)=%d err=%v", n, err)
+	}
+	// aggregate over the filter column itself
+	vals1, err := e.ColumnAggregatesFiltered("cs_t", 1, []string{"count"}, eq, nil)
+	if err != nil || len(vals1) != 1 || vals1[0].Int != 1 {
+		t.Fatalf("ColumnAggregatesFiltered(eq,self)=%v err=%v", vals1, err)
+	}
+	// aggregate over a different column than the predicate
+	vals2, err := e.ColumnAggregatesFiltered("cs_t", 2, []string{"sum", "count"}, eq, nil)
+	if err != nil || len(vals2) != 2 || vals2[0].Int != 30 || vals2[1].Int != 1 {
+		t.Fatalf("ColumnAggregatesFiltered(eq,other)=%v err=%v", vals2, err)
+	}
+
+	// leading-literal LIKE prefix: 'ap%' matches apple + apricot
+	like := &sqlx.ColumnFilter{Col: 1, Op: "LIKE", Lit: sqlx.StrValue("ap")}
+	n, err = e.ColumnCountFiltered("cs_t", like, nil)
+	if err != nil || n != 2 {
+		t.Fatalf("ColumnCountFiltered(like)=%d err=%v", n, err)
+	}
+	vals3, err := e.ColumnAggregatesFiltered("cs_t", 2, []string{"sum"}, like, nil)
+	if err != nil || len(vals3) != 1 || vals3[0].Int != 30 {
+		t.Fatalf("ColumnAggregatesFiltered(like,other)=%v err=%v", vals3, err)
+	}
+
+	// ScanColumnsFiltered: only v + score materialized, matching rows only
+	rows, err := e.ScanColumnsFiltered("cs_t", []int{1, 2}, like, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("ScanColumnsFiltered rows=%d", len(rows))
+	}
+	got := map[string]int64{}
+	for _, r := range rows {
+		if !r[0].Null || r[0].Type != sqlx.TypeNull {
+			t.Fatalf("unrequested id must be Null (full-width row): %v", r)
+		}
+		got[r[1].Str] = r[2].Int
+	}
+	if got["apple"] != 10 || got["apricot"] != 20 {
+		t.Fatalf("ScanColumnsFiltered: %v", got)
+	}
+
+	// filter over a PK-range window (ids 1,2 both match 'ap%')
+	w := &sqlx.PKRange{
+		Lower: &sqlx.PKBound{Prefix: []sqlx.Value{sqlx.IntValue(1)}, Incl: true},
+		Upper: &sqlx.PKBound{Prefix: []sqlx.Value{sqlx.IntValue(3)}, Incl: true},
+	}
+	n, err = e.ColumnCountFiltered("cs_t", like, w)
+	if err != nil || n != 2 {
+		t.Fatalf("ColumnCountFiltered(range)=%d err=%v", n, err)
+	}
+}
+
+// TestCStoreGroupedAggregates exercises the inline-hash grouped aggregate path
+// (sqlx.ColumnEngine.ColumnGroupedAggregates): grouping by a string and an int
+// column, with several aggregate columns, verifying counts/sums per group and
+// that the group values come back correct (collision-safe raw-byte keys).
+func TestCStoreGroupedAggregates(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	schema := &sqlx.TableSchema{
+		Name:   "cs_t",
+		Engine: "CSTORE",
+		Columns: []sqlx.ColumnDef{
+			{Name: "id", Type: sqlx.TypeInt, NotNull: true, AsPrimary: true},
+			{Name: "level", Type: sqlx.TypeString},
+			{Name: "region", Type: sqlx.TypeInt},
+			{Name: "lat", Type: sqlx.TypeInt},
+		},
+		PK: []string{"id"},
+	}
+	if err := e.CreateTable(schema); err != nil {
+		t.Fatal(err)
+	}
+	// rows with 3 string groups interleaved by id and 2 int groups
+	rows := []struct {
+		id     int64
+		level  string
+		region int64
+		lat    int64
+	}{
+		{1, "a", 1, 10}, {2, "b", 1, 20}, {3, "a", 2, 30},
+		{4, "c", 2, 40}, {5, "b", 1, 50}, {6, "a", 1, 60},
+		{7, "c", 2, 70}, {8, "b", 2, 80},
+	}
+	for _, r := range rows {
+		if err := e.Insert("cs_t", map[string]sqlx.Value{
+			"id": sqlx.IntValue(r.id), "level": sqlx.StrValue(r.level),
+			"region": sqlx.IntValue(r.region), "lat": sqlx.IntValue(r.lat),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// group by level, aggregates: count(*) + sum(lat) + count(region)
+	gas := []sqlx.GroupAgg{
+		{Col: -1, Aggs: []string{"count"}},
+		{Col: 3, Aggs: []string{"sum"}},
+		{Col: 2, Aggs: []string{"count"}},
+	}
+	rows1, err := e.ColumnGroupedAggregates("cs_t", 1, gas, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]int64{
+		"a": {3, 100, 3},
+		"b": {3, 150, 3},
+		"c": {2, 110, 2},
+	}
+	if len(rows1) != len(want) {
+		t.Fatalf("grouped rows=%d want %d", len(rows1), len(want))
+	}
+	for _, r := range rows1 {
+		g := r[0].Str
+		w, ok := want[g]
+		if !ok {
+			t.Fatalf("unexpected group %q", g)
+		}
+		if r[1].Int != w[0] || r[2].Int != w[1] || r[3].Int != w[2] {
+			t.Fatalf("group %q: %v want %v", g, r, w)
+		}
+	}
+
+	// group by an int column: region has 2 groups (1,2); one output col per
+	// GroupAgg entry
+	gas2 := []sqlx.GroupAgg{
+		{Col: 3, Aggs: []string{"sum"}},
+		{Col: 3, Aggs: []string{"count"}},
+	}
+	rows2, err := e.ColumnGroupedAggregates("cs_t", 2, gas2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want2 := map[int64][]int64{
+		1: {140, 4}, // lat sums: 10+20+50+60; 4 rows
+		2: {220, 4}, // 30+40+70+80; 4 rows
+	}
+	if len(rows2) != len(want2) {
+		t.Fatalf("int grouped rows=%d", len(rows2))
+	}
+	for _, r := range rows2 {
+		g := r[0].Int
+		w, ok := want2[g]
+		if !ok {
+			t.Fatalf("unexpected int group %d", g)
+		}
+		if r[1].Int != w[0] || r[2].Int != w[1] {
+			t.Fatalf("int group %d: %v want %v", g, r, w)
+		}
+	}
+
+	// grouped over a PK-range window (ids 3..6): a:30+60, c:40, b:50
+	rng := &sqlx.PKRange{
+		Lower: &sqlx.PKBound{Prefix: []sqlx.Value{sqlx.IntValue(3)}, Incl: true},
+		Upper: &sqlx.PKBound{Prefix: []sqlx.Value{sqlx.IntValue(6)}, Incl: true},
+	}
+	rows3, err := e.ColumnGroupedAggregates("cs_t", 1, []sqlx.GroupAgg{{Col: 3, Aggs: []string{"sum"}}}, rng)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want3 := map[string]int64{"a": 90, "b": 50, "c": 40}
+	if len(rows3) != len(want3) {
+		t.Fatalf("windowed grouped rows=%d", len(rows3))
+	}
+	for _, r := range rows3 {
+		if w, ok := want3[r[0].Str]; !ok || r[1].Int != w {
+			t.Fatalf("windowed group %q: %v", r[0].Str, r)
+		}
+	}
+}
+
+func TestCStoreScanTopN(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	if err := e.CreateTable(&sqlx.TableSchema{
+		Name:   "cs_t",
+		Engine: "CSTORE",
+		Columns: []sqlx.ColumnDef{
+			{Name: "id", Type: sqlx.TypeInt, NotNull: true, AsPrimary: true},
+			{Name: "v", Type: sqlx.TypeString},
+			{Name: "score", Type: sqlx.TypeInt},
+		},
+		PK: []string{"id"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 10; i++ {
+		if err := e.Insert("cs_t", map[string]sqlx.Value{
+			"id":    sqlx.IntValue(int64(i)),
+			"v":     sqlx.StrValue(fmt.Sprintf("row%d", i)),
+			"score": sqlx.IntValue(int64(i * 7)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// descending top-3, "id" + "score" materialized (ids 10,9,8)
+	rows, err := e.ScanTopN("cs_t", []int{0, 2}, nil, true, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("topn rows=%d want 3", len(rows))
+	}
+	for i, r := range rows {
+		wantID := int64(10 - i)
+		if r[0].Int != wantID || r[1] != sqlx.NullValue || r[2].Int != wantID*7 {
+			t.Fatalf("desc row %d: %v", i, r)
+		}
+	}
+
+	// ascending top-3, full width
+	rows, err = e.ScanTopN("cs_t", []int{0, 1, 2}, nil, false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range rows {
+		wantID := int64(i + 1)
+		if r[0].Int != wantID || r[1] != sqlx.StrValue(fmt.Sprintf("row%d", i+1)) || r[2].Int != wantID*7 {
+			t.Fatalf("asc row %d: %v", i, r)
+		}
+	}
+
+	// limit >= row count returns everything
+	rows, err = e.ScanTopN("cs_t", []int{0}, nil, false, 100)
+	if err != nil || len(rows) != 10 {
+		t.Fatalf("limit>rows: n=%d err=%v", len(rows), err)
+	}
+
+	// PK range [3, 6) restricted to ids 3,4,5, descending top-2 -> ids 5,4
+	rows, err = e.ScanTopN("cs_t", []int{0}, &sqlx.PKRange{
+		Lower: &sqlx.PKBound{Prefix: []sqlx.Value{sqlx.IntValue(3)}, Incl: true},
+		Upper: &sqlx.PKBound{Prefix: []sqlx.Value{sqlx.IntValue(6)}, Incl: false},
+	}, true, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0][0].Int != 5 || rows[1][0].Int != 4 {
+		t.Fatalf("range topn: %v err=%v", rows, err)
+	}
+}
+
 // TestCStoreAggregateSQL verifies aggregate pushdown through the SQL executor
 // matches the in-memory path.
 func TestCStoreAggregateSQL(t *testing.T) {
@@ -764,6 +1364,61 @@ func TestCStoreAggregateSQL(t *testing.T) {
 	}
 	if r.Rows[0][0].String() != "70" {
 		t.Fatalf("where-sum=%v", r.Rows[0])
+	}
+}
+
+// TestCStoreTopNSQL verifies the ORDER BY PK ... LIMIT pushdown through the
+// SQL executor (bounded PK-index scan) returns the same rows as the generic
+// full-scan + sort path.
+func TestCStoreTopNSQL(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	if err := e.CreateTable(&sqlx.TableSchema{
+		Name:   "cs_t",
+		Engine: "CSTORE",
+		Columns: []sqlx.ColumnDef{
+			{Name: "id", Type: sqlx.TypeInt, NotNull: true, AsPrimary: true},
+			{Name: "v", Type: sqlx.TypeString},
+			{Name: "score", Type: sqlx.TypeInt},
+		},
+		PK: []string{"id"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ex := sqlx.NewExecutor(e)
+	for i := int64(1); i <= 6; i++ {
+		if _, err := ex.Execute(mustParse(t, fmt.Sprintf("INSERT INTO cs_t VALUES (%d, 'v%d', %d)", i, i, i*10))[0]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		sql   string
+		want  string
+		limit bool
+	}{
+		{"SELECT id, score FROM cs_t ORDER BY id DESC LIMIT 3", "6,60|5,50|4,40", true},
+		{"SELECT id, score FROM cs_t ORDER BY id ASC LIMIT 2", "1,10|2,20", true},
+		{"SELECT id FROM cs_t WHERE id >= 3 AND id < 6 ORDER BY id DESC LIMIT 2", "5|4", true},
+		{"SELECT v FROM cs_t ORDER BY score DESC LIMIT 2", "v6|v5", false},
+		{"SELECT id FROM cs_t ORDER BY id DESC", "6|5|4|3|2|1", false},
+		{"SELECT id FROM cs_t WHERE score > 10 ORDER BY id DESC LIMIT 2", "6|5", false},
+	}
+	for _, c := range cases {
+		r, err := ex.Execute(mustParse(t, c.sql)[0])
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		got := make([]string, len(r.Rows))
+		for i, row := range r.Rows {
+			parts := make([]string, len(row))
+			for j, v := range row {
+				parts[j] = v.String()
+			}
+			got[i] = strings.Join(parts, ",")
+		}
+		if strings.Join(got, "|") != c.want {
+			t.Fatalf("%s = %v want %s", c.sql, got, c.want)
+		}
 	}
 }
 
@@ -946,6 +1601,11 @@ func TestCStoreWherePruneTimestamps(t *testing.T) {
 		{"SELECT SUM(lat) FROM logs WHERE ts >= '2024-01-01T12:00:00Z' AND ts <= '2024-01-01T14:00:00Z'", "390"},
 		{"SELECT MAX(lat) FROM logs WHERE ts >= '2024-01-01T00:00:00Z' AND ts < '2024-01-01T01:00:00Z'", "0"},
 		{"SELECT COUNT(*) FROM logs WHERE ts = '2024-01-01T03:00:00Z'", "1"},
+		// far-future/limit bounds must not overflow the int64 timestamp encoding
+		// (UnixNano overflows after ~2262; storage now uses microseconds).
+		{"SELECT COUNT(*) FROM logs WHERE ts >= '2024-01-01T00:00:00Z' AND ts < '9999-12-31T23:59:59Z'", "24"},
+		{"SELECT COUNT(*) FROM logs WHERE ts >= '0001-01-01T00:00:00Z' AND ts <= '9999-12-31T23:59:59Z'", "24"},
+		{"SELECT COUNT(*) FROM logs WHERE ts >= '2262-04-11T23:47:16Z'", "0"},
 	}
 	for _, c := range cases {
 		r, err := ex.Execute(mustParse(t, c.sql)[0])
@@ -1295,4 +1955,115 @@ func TestLikeStringPkPrune(t *testing.T) {
 			t.Fatalf("%q = %v want %q", c.sql, got, c.want)
 		}
 	}
+}
+
+// TestCStoreLiveRowCounter verifies the whole-table live-row counter kept per
+// CSTORE table stays exact under insert (incl. duplicates), delete, update
+// (same and changed PK), batch insert, drop/recreate and mixed workloads.
+func TestCStoreLiveRowCounter(t *testing.T) {
+	e := newTestEngine(t)
+	defer e.Close()
+	schema := &sqlx.TableSchema{
+		Name:   "t",
+		Engine: "CSTORE",
+		Columns: []sqlx.ColumnDef{
+			{Name: "id", Type: sqlx.TypeInt, NotNull: true, AsPrimary: true},
+			{Name: "v", Type: sqlx.TypeString},
+		},
+		PK: []string{"id"},
+	}
+	if err := e.CreateTable(schema); err != nil {
+		t.Fatal(err)
+	}
+	rows := func(k, n int) []map[string]sqlx.Value {
+		out := make([]map[string]sqlx.Value, 0, n)
+		for i := k; i < k+n; i++ {
+			out = append(out, map[string]sqlx.Value{
+				"id": sqlx.IntValue(int64(i)), "v": sqlx.StrValue("r"),
+			})
+		}
+		return out
+	}
+	liveRows := func() int {
+		t.Helper()
+		proj, err := e.ScanColumns("t", []int{0}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(proj)
+	}
+	check := func(want int64) {
+		t.Helper()
+		n, err := e.ColumnCount("t", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Fatalf("ColumnCount=%d want %d", n, want)
+		}
+		if int64(liveRows()) != want {
+			t.Fatalf("scan rows=%d want %d", liveRows(), want)
+		}
+	}
+	for _, r := range rows(0, 5) {
+		if err := e.Insert("t", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(5)
+	// duplicate pk overwrites: count must not move
+	if err := e.Insert("t", rows(0, 1)[0]); err != nil {
+		t.Fatal(err)
+	}
+	check(5)
+	// delete one live row
+	if err := e.Delete("t", []sqlx.Value{sqlx.IntValue(2)}); err != nil {
+		t.Fatal(err)
+	}
+	check(4)
+	// delete a non-existent pk: count must not move
+	if err := e.Delete("t", []sqlx.Value{sqlx.IntValue(99)}); err != nil {
+		t.Fatal(err)
+	}
+	check(4)
+	// update with same PK
+	if err := e.Update("t", []sqlx.Value{sqlx.IntValue(1)}, map[string]sqlx.Value{"v": sqlx.StrValue("z")}); err != nil {
+		t.Fatal(err)
+	}
+	check(4)
+	// update with changed PK
+	if err := e.Update("t", []sqlx.Value{sqlx.IntValue(1)}, map[string]sqlx.Value{"id": sqlx.IntValue(10)}); err != nil {
+		t.Fatal(err)
+	}
+	check(4)
+	// batch insert of new rows
+	if _, err := e.BatchInsert("t", rows(100, 3)); err != nil {
+		t.Fatal(err)
+	}
+	check(7)
+	// mixed churn: del + dup-insert + batch, then verify against scan
+	if err := e.Delete("t", []sqlx.Value{sqlx.IntValue(100)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Insert("t", rows(11, 1)[0]); err != nil { // new pk
+		t.Fatal(err)
+	}
+	if err := e.Insert("t", rows(100, 1)[0]); err != nil { // resurrect 100
+		t.Fatal(err)
+	}
+	check(8)
+	// drop resets: recreate with a fresh counter
+	if err := e.DropTable("t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ColumnCount("t", nil); err == nil {
+		t.Fatal("expected error for dropped table")
+	}
+	if err := e.CreateTable(schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.BatchInsert("t", rows(0, 2)); err != nil {
+		t.Fatal(err)
+	}
+	check(2)
 }

@@ -517,6 +517,94 @@ func evalCall(n *Call, ctx map[string]Value) (Value, error) {
 		return TimestampValue(time.Now()), nil
 	case "unixepoch":
 		return IntValue(time.Now().Unix()), nil
+	case "time_bucket":
+		if len(n.Args) != 2 {
+			return NullValue, fmt.Errorf("time_bucket(interval, ts) needs 2 args")
+		}
+		iv, err := Eval(n.Args[0], ctx)
+		if err != nil {
+			return NullValue, err
+		}
+		ts, err := Eval(n.Args[1], ctx)
+		if err != nil {
+			return NullValue, err
+		}
+		if iv.Null || ts.Null {
+			return NullValue, nil
+		}
+		d, err := parseInterval(iv)
+		if err != nil {
+			return NullValue, err
+		}
+		if d <= 0 {
+			return NullValue, fmt.Errorf("time_bucket interval must be positive")
+		}
+		t, err := Convert(ts, TypeTimestamp)
+		if err != nil {
+			return NullValue, err
+		}
+		return TimestampValue(t.Tm.UTC().Truncate(d)), nil
 	}
 	return NullValue, fmt.Errorf("unknown function %q", n.Name)
+}
+
+// parseInterval parses a bucket/interval value: a number (seconds), a numeric
+// string ("3600"), or a compound duration string ("1h30m", "15m", "7d", "2w").
+func parseInterval(v Value) (time.Duration, error) {
+	if v.Type == TypeInt || v.Type == TypeFloat {
+		f, _ := v.AsFloat()
+		if f <= 0 {
+			return 0, fmt.Errorf("interval must be positive seconds")
+		}
+		return time.Duration(f * float64(time.Second)), nil
+	}
+	s := strings.ToLower(strings.TrimSpace(v.String()))
+	if s == "" {
+		return 0, fmt.Errorf("empty interval")
+	}
+	if n, err := strconv.ParseFloat(s, 64); err == nil {
+		if n <= 0 {
+			return 0, fmt.Errorf("interval must be positive seconds")
+		}
+		return time.Duration(n * float64(time.Second)), nil
+	}
+	var total time.Duration
+	for len(s) > 0 {
+		k := 0
+		for k < len(s) && (s[k] >= '0' && s[k] <= '9' || s[k] == '.') {
+			k++
+		}
+		if k == 0 {
+			return 0, fmt.Errorf("invalid interval %q", v.String())
+		}
+		num, err := strconv.ParseFloat(s[:k], 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid interval %q", v.String())
+		}
+		s = s[k:]
+		k = 0
+		for k < len(s) && s[k] >= 'a' && s[k] <= 'z' {
+			k++
+		}
+		unit := s[:k]
+		s = s[k:]
+		if unit == "" {
+			return 0, fmt.Errorf("invalid interval %q (missing unit)", v.String())
+		}
+		switch unit {
+		case "s", "sec", "secs", "second", "seconds":
+			total += time.Duration(num * float64(time.Second))
+		case "m", "min", "mins", "minute", "minutes":
+			total += time.Duration(num * float64(time.Minute))
+		case "h", "hr", "hrs", "hour", "hours":
+			total += time.Duration(num * float64(time.Hour))
+		case "d", "day", "days":
+			total += time.Duration(num * 24 * float64(time.Hour))
+		case "w", "week", "weeks":
+			total += time.Duration(num * 7 * 24 * float64(time.Hour))
+		default:
+			return 0, fmt.Errorf("unknown interval unit %q", unit)
+		}
+	}
+	return total, nil
 }

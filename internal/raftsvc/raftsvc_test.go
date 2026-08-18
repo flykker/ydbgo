@@ -1,8 +1,10 @@
 package raftsvc
 
 import (
+	"fmt"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -262,6 +264,55 @@ func waitLeader(t *testing.T, n *Node, d time.Duration) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("no leader")
+}
+
+// TestBatcherCoalescing verifies the adaptive group-commit window folds
+// concurrent write statements into a single raft entry (with a generous
+// window configured so the test is deterministic).
+func TestBatcherCoalescing(t *testing.T) {
+	t.Setenv("YDBGO_BATCH_WINDOW_MS", "400")
+	t.Setenv("YDBGO_BATCH_HARD_WINDOW_MS", "400")
+	n, err := NewNode(Config{
+		ID:       "n1",
+		RaftAddr: freePort(t),
+		DataDir:  filepath.Join(t.TempDir(), "data"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	if err := n.Start(true, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitLeader(t, n, 5*time.Second)
+	if _, err := n.Execute("CREATE TABLE t (id int64 primary key, v string)"); err != nil {
+		t.Fatal(err)
+	}
+
+	before := n.group.Raft().LastIndex()
+	const writes = 8
+	var wg sync.WaitGroup
+	for i := 0; i < writes; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := n.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d, 'v%d')", i, i)); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	after := n.group.Raft().LastIndex()
+	if applied := after - before; applied >= writes {
+		t.Fatalf("%d concurrent writes produced %d raft entries, want coalescing (fewer than writes)", writes, applied)
+	}
+	r, err := n.Execute("SELECT COUNT(*) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Rows[0][0].Int != writes {
+		t.Errorf("count=%v want %d", r.Rows[0][0], writes)
+	}
 }
 
 func TestLeaderFailover(t *testing.T) {

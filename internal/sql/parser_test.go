@@ -183,8 +183,9 @@ func TestParseMultiple(t *testing.T) {
 func TestBinaryStatementCodec(t *testing.T) {
 	cases := []string{
 		`CREATE TABLE t (id int64 primary key, name string not null default 'x', age int64 default 0) ENGINE=KV`,
-		`DROP TABLE IF EXISTS t`,
+		`CREATE INDEX IF NOT EXISTS ix ON t (name)`,
 		`DROP INDEX IF EXISTS ix t`,
+		`DROP TABLE IF EXISTS t`,
 		`INSERT INTO t (id, name, age) VALUES (1, 'a', 2), (3, 'b', 4)`,
 		`UPDATE t SET age = 31 WHERE name = 'Bob' AND id > 0`,
 		`DELETE FROM t WHERE id <= 5`,

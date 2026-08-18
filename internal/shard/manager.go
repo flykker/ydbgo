@@ -161,7 +161,26 @@ func (m *Manager) Start(bootstrap bool, joinAddr string) error {
 }
 
 // requestJoin asks an existing node to add us to the meta group and register us.
+// It retries for a while: a cluster started from config can bring the bootstrap
+// node up after the joiners (no ordering guarantee), and joining before the
+// target is listening must not kill the node.
 func (m *Manager) requestJoin(joinAddr string) error {
+	const retryFor = 30 * time.Second
+	deadline := time.Now().Add(retryFor)
+	var lastErr error
+	for {
+		lastErr = m.joinOnce(joinAddr)
+		if lastErr == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("join %s after %s: %w", joinAddr, retryFor, lastErr)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (m *Manager) joinOnce(joinAddr string) error {
 	return m.pool.Do(joinAddr, func(c *proto.Client) error {
 		resp, err := c.Execute(fmt.Sprintf("ADMIN JOIN %s %s", m.id, m.raftAddr))
 		if err != nil {
@@ -297,9 +316,9 @@ func (m *Manager) route(st sqlx.Statement) (*sqlx.Result, error) {
 	case *sqlx.RollbackStmt:
 		return &sqlx.Result{Type: "rollback"}, nil
 	case *sqlx.CreateIndexStmt:
-		return &sqlx.Result{Type: "create_index"}, nil
+		return m.ddlCreateIndex(s)
 	case *sqlx.DropIndexStmt:
-		return &sqlx.Result{Type: "drop_index"}, nil
+		return m.ddlDropIndex(s)
 	case *sqlx.CreateDatabaseStmt:
 		return &sqlx.Result{Type: "create_database"}, nil
 	case *sqlx.KVPutStmt:
@@ -315,7 +334,11 @@ func (m *Manager) route(st sqlx.Statement) (*sqlx.Result, error) {
 }
 
 func fail(req *proto.Request, err error) *proto.Response {
-	return &proto.Response{ID: req.ID, OK: false, Error: err.Error()}
+	var id int64
+	if req != nil {
+		id = req.ID
+	}
+	return &proto.Response{ID: id, OK: false, Error: err.Error()}
 }
 
 func payloadOf(r *sqlx.Result) *proto.ResultPayload {
@@ -372,7 +395,11 @@ func (m *Manager) forwardToLeaderSQL(req *proto.Request, sql string) *proto.Resp
 		return fail(req, err)
 	}
 	if addr == m.sqlAddr {
-		return m.Handle(&proto.Request{ID: req.ID, SQL: sql})
+		var id int64
+		if req != nil {
+			id = req.ID
+		}
+		return m.Handle(&proto.Request{ID: id, SQL: sql})
 	}
 	var resp *proto.Response
 	err = m.pool.Do(addr, func(c *proto.Client) error {
@@ -563,14 +590,15 @@ func (m *Manager) scanShardTyped(spec *ShardSpec, sql string, types []sqlx.Type)
 
 // scanShardProjected reads only the given columns from one shard so CSTORE
 // nodes can run columnar scans, then pads each row back to full schema width.
-// whereSQL is an optional " WHERE ..." clause pushed down so the shard-local
-// scan can prune to the query's PK range.
-func (m *Manager) scanShardProjected(spec *ShardSpec, cols []string, whereSQL string) ([]sqlx.Row, error) {
+// tailSQL is an optional " WHERE ..." clause (with any ORDER BY / LIMIT)
+// pushed down so the shard-local scan can prune to the query's PK range and
+// stop early.
+func (m *Manager) scanShardProjected(spec *ShardSpec, cols []string, tailSQL string) ([]sqlx.Row, error) {
 	ts := m.table(spec.Table)
 	if ts == nil {
 		return nil, fmt.Errorf("table %q not found", spec.Table)
 	}
-	stmt := "SELECT " + strings.Join(cols, ", ") + " FROM " + spec.Table + whereSQL
+	stmt := "SELECT " + strings.Join(cols, ", ") + " FROM " + spec.Table + tailSQL
 	if m.hosts(spec) {
 		sh := m.localShard(spec.ID)
 		if sh == nil {
@@ -711,3 +739,5 @@ func portOf(addr string) int {
 }
 
 func osStat(p string) (os.FileInfo, error) { return os.Stat(p) }
+
+func osRemoveAll(p string) error { return os.RemoveAll(p) }

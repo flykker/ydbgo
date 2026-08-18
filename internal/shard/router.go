@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,12 +48,40 @@ func (m *Manager) handleAdmin(req *proto.Request, upper string) *proto.Response 
 		return m.handleUnmountShard(req)
 	case strings.HasPrefix(upper, "ADMIN SHARDS "):
 		return m.handleShards(req)
+	case strings.HasPrefix(upper, "ADMIN TABLES"):
+		return m.handleTables(req)
 	case strings.HasPrefix(upper, "ADMIN SPLIT "):
 		return m.handleSplit(req)
+	case strings.HasPrefix(upper, "ADMIN COMPACT"):
+		return m.handleCompact(req)
+	case strings.HasPrefix(upper, "ADMIN METRICS-JSON"):
+		return &proto.Response{ID: req.ID, OK: true, Result: &proto.ResultPayload{Type: "admin", Note: m.met.reportJSON()}}
 	case strings.HasPrefix(upper, "ADMIN METRICS"):
 		return &proto.Response{ID: req.ID, OK: true, Result: &proto.ResultPayload{Type: "admin", Note: m.met.report()}}
 	}
 	return fail(req, errors.New("unknown admin command"))
+}
+
+// handleCompact forces a full LSM compaction over every store of every local
+// shard group, collapsing the freshly-written L0 SSTable runs after a bulk
+// load. Runs locally: each node compacts its own data (ADMIN COMPACT).
+func (m *Manager) handleCompact(req *proto.Request) *proto.Response {
+	var engs []*storage.Engine
+	m.mu.RLock()
+	for _, sh := range m.shards {
+		engs = append(engs, sh.node.Engine())
+	}
+	m.mu.RUnlock()
+	var firstErr error
+	for _, eng := range engs {
+		if err := eng.CompactLSM(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return fail(req, firstErr)
+	}
+	return &proto.Response{ID: req.ID, OK: true, Result: &proto.ResultPayload{Type: "admin"}}
 }
 
 // handleAdminJoin adds a node to the meta group. Must run on the meta leader.
@@ -324,6 +353,12 @@ func (m *Manager) handleUnmountShard(req *proto.Request) *proto.Response {
 	if ok {
 		_ = sh.node.Close()
 	}
+	// Physically destroy the replica (raft log + engine data): a dropped table
+	// must not leave stale rows behind that a later CREATE TABLE with the same
+	// deterministic shard ID would resurrect by resuming the old raft log.
+	if err := osRemoveAll(filepath.Join(m.dataDir, "shard-"+shardID)); err != nil {
+		return fail(req, fmt.Errorf("unmount %s: %w", shardID, err))
+	}
 	return &proto.Response{ID: req.ID, OK: true, Result: &proto.ResultPayload{Type: "admin"}}
 }
 
@@ -345,6 +380,32 @@ func (m *Manager) handleShards(req *proto.Request) *proto.Response {
 			string(s.End),
 			strings.Join(s.Nodes, ","),
 			strconv.FormatUint(s.Size, 10),
+		})
+	}
+	return &proto.Response{ID: req.ID, OK: true, Result: p}
+}
+
+// handleTables lists all tables in the catalog with their shard counts and
+// total stored size (for the UI cluster view).
+func (m *Manager) handleTables(req *proto.Request) *proto.Response {
+	cat := m.meta.FSM().Catalog()
+	names := make([]string, 0, len(cat.Tables))
+	for name := range cat.Tables {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	p := &proto.ResultPayload{Type: "select", Columns: []string{"table", "engine", "shards", "size"}}
+	for _, name := range names {
+		ts := cat.Tables[name]
+		var size uint64
+		for _, s := range ts.Shards {
+			size += s.Size
+		}
+		p.Rows = append(p.Rows, []string{
+			name,
+			ts.Schema.Engine,
+			strconv.Itoa(len(ts.Shards)),
+			strconv.FormatUint(size, 10),
 		})
 	}
 	return &proto.Response{ID: req.ID, OK: true, Result: p}
@@ -405,10 +466,97 @@ func (m *Manager) ddlDropTable(st *sqlx.DropTableStmt) (*sqlx.Result, error) {
 		}
 		return &sqlx.Result{Type: "drop_table"}, nil
 	}
+	ts := m.table(st.Name)
 	if err := m.meta.DropTable(st.Name); err != nil {
 		return nil, err
 	}
+	// Physically destroy every shard replica of the dropped table so a later
+	// CREATE TABLE with the same name starts from empty data. Each placement
+	// node unmounts (closes and deletes) its local copy.
+	if ts != nil {
+		for _, spec := range ts.Shards {
+			for _, nid := range spec.Nodes {
+				if err := m.dropShardReplica(nid, spec); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
 	return &sqlx.Result{Type: "drop_table", Affected: 1}, nil
+}
+
+// dropShardReplica unmounts (closes + deletes) the local copy of a shard on
+// the given placement node.
+func (m *Manager) dropShardReplica(nodeID string, spec *ShardSpec) error {
+	addr := m.nodeSQLAddr(nodeID)
+	if addr == "" {
+		return fmt.Errorf("placement node %s not registered", nodeID)
+	}
+	if addr == m.sqlAddr {
+		m.mu.Lock()
+		if sh, ok := m.shards[spec.ID]; ok {
+			delete(m.shards, spec.ID)
+			_ = sh.node.Close()
+		}
+		m.mu.Unlock()
+		if err := osRemoveAll(filepath.Join(m.dataDir, "shard-"+spec.ID)); err != nil {
+			return err
+		}
+		return nil
+	}
+	resp, err := m.remoteAdmin(addr, fmt.Sprintf("ADMIN UNMOUNT-SHARD %s %s", spec.Table, spec.ID))
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errors.New(resp.Error)
+	}
+	return nil
+}
+
+// ddlCreateIndex builds a secondary index on every shard of a table: each
+// shard leader applies the CREATE INDEX through its own raft group, so the
+// local index (backfilled from that shard's rows) is replicated to the
+// followers and kept in sync by subsequent DML.
+func (m *Manager) ddlCreateIndex(st *sqlx.CreateIndexStmt) (*sqlx.Result, error) {
+	ts := m.table(st.Table)
+	if ts == nil {
+		return nil, notFound(st.Table)
+	}
+	if err := m.broadcastShardDDL(ts, sqlx.StatementString(st)); err != nil {
+		return nil, err
+	}
+	return &sqlx.Result{Type: "create_index", Affected: 1}, nil
+}
+
+// ddlDropIndex removes a secondary index from every shard of a table.
+func (m *Manager) ddlDropIndex(st *sqlx.DropIndexStmt) (*sqlx.Result, error) {
+	if st.Table == "" {
+		return nil, errors.New("drop index requires a table name (e.g. DROP INDEX ix ON t)")
+	}
+	ts := m.table(st.Table)
+	if ts == nil {
+		return nil, notFound(st.Table)
+	}
+	if err := m.broadcastShardDDL(ts, sqlx.StatementString(st)); err != nil {
+		return nil, err
+	}
+	return &sqlx.Result{Type: "drop_index", Affected: 1}, nil
+}
+
+// broadcastShardDDL applies a DDL statement to the leader of every shard of a
+// table. It runs the shards serially so a failure aborts before the rest.
+func (m *Manager) broadcastShardDDL(ts *TableSpec, sql string) error {
+	for _, spec := range ts.Shards {
+		resp, err := m.execShardSQL(spec, sql)
+		if err != nil {
+			return err
+		}
+		if !resp.OK {
+			return errors.New(resp.Error)
+		}
+	}
+	return nil
 }
 
 // normalizeSchema mirrors the executor's CREATE TABLE normalization.
@@ -708,12 +856,31 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 		}
 	}
 	// Derive a PK range from WHERE: skip shards that cannot contain matching
-	// rows and let each shard-local scan prune to the range.
-	rng, rngExact := sqlx.PKRangeFromWhere(ts.Schema, st.Where)
+	// rows and let each shard-local scan prune to the range. whereExact reports
+	// whether the WHERE is fully consumed as a PK range (plus at most one
+	// non-PK predicate), which gates aggregate/grouped pushdown below.
+	rng, _, whereExact := sqlx.PlanWhere(ts.Schema, st.Where)
 	plLower, plUpper := storage.PKRangeBytes(rng)
 	whereSQL := ""
 	if st.Where != nil {
 		whereSQL = " WHERE " + sqlx.ExprString(st.Where)
+	}
+	// ORDER BY PK + LIMIT: push the sort/limit down to each shard (whose local
+	// executor answers it with a bounded PK-index scan), then the coordinator
+	// re-orders the few shard tops and applies the global limit.
+	topTail := ""
+	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || whereExact) {
+		if pk, desc, limit, ok := sqlx.PlanTopN(st, ts.Schema); ok {
+			dir := "ASC"
+			if desc {
+				dir = "DESC"
+			}
+			ob := make([]string, len(pk))
+			for i, p := range pk {
+				ob[i] = p + " " + dir
+			}
+			topTail = " ORDER BY " + strings.Join(ob, ", ") + " LIMIT " + strconv.FormatInt(limit, 10)
+		}
 	}
 	// scan narrowest (hottest) shards first so their values win on overlap
 	shards := make([]*ShardSpec, len(ts.Shards))
@@ -727,7 +894,7 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 	}
 	// For CSTORE whole-table aggregate SELECTs push mergeable partial
 	// aggregates down to each shard and combine them: no rows cross the wire.
-	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || rngExact) {
+	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || whereExact) {
 		if plan, ok := sqlx.PlanAggregate(st, ts.Schema); ok {
 			ptypes := plan.PartialTypes(ts.Schema)
 			partials, err := m.parallelShardRows(shards, func(spec *ShardSpec) bool { return skipShard(spec) }, func(spec *ShardSpec) ([]sqlx.Row, error) {
@@ -742,7 +909,7 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 	}
 	// For CSTORE single-column GROUP BY push partial groups down to each shard
 	// and merge groups with equal keys: only group rows cross the wire.
-	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || rngExact) {
+	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || whereExact) {
 		if plan, ok := sqlx.PlanGrouped(st, ts.Schema); ok {
 			ptypes := plan.PartialTypes(ts.Schema)
 			partials, err := m.parallelShardRows(shards, func(spec *ShardSpec) bool { return skipShard(spec) }, func(spec *ShardSpec) ([]sqlx.Row, error) {
@@ -756,10 +923,11 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 		}
 	}
 	all, err := m.parallelShardRows(shards, func(spec *ShardSpec) bool { return skipShard(spec) }, func(spec *ShardSpec) ([]sqlx.Row, error) {
+		tail := whereSQL + topTail
 		if proj != nil {
-			return m.scanShardProjected(spec, proj, whereSQL)
+			return m.scanShardProjected(spec, proj, tail)
 		}
-		return m.scanShard(spec, "SELECT * FROM "+spec.Table+whereSQL)
+		return m.scanShard(spec, "SELECT * FROM "+spec.Table+tail)
 	})
 	if err != nil {
 		return nil, err

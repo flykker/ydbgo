@@ -14,10 +14,33 @@
 | 4 | **Шардовый `GROUP BY`** — частичные группы на шардах + merge по ключу у координатора (типизированная передача партиалов) | ✅ сделано, `TestShardedCStoreGroupByPushdown` зелёный |
 | 5 | **Auto-TTL (retention)** — `RETENTION = '<window>'` в `CREATE TABLE` + фоновый цикл на лидере каждого шарда | ✅ сделано, `TestShardedCStoreAutoTTL` зелёный |
 | 6 | **`LIKE`/`NOT LIKE`** — во всех движках (в т.ч. через шарды) + префиксный PK-range для `'префикс%'` в CSTORE | ✅ сделано, `TestLike`/`TestLikeStringPkPrune`/`TestShardedCStoreLike` зелёные |
+| 7 | **Вторичные индексы** — `CREATE/DROP INDEX`, обслуживание в DML, fast-path для `=`/`LIKE` в колоночном планировщике | ✅ сделано, `TestSQLIndexEndToEnd`/`TestIndex*` зелёные |
+| 8 | **Batch-insert + group-commit тюнинг** — `BatchInsert` (один lock/commit), адаптивное окно батча, pipelined raft-apply | ✅ сделано, `TestEngineBatchInsert`/`TestBatcherCoalescing` зелёные |
+| 9 | **`ADMIN COMPACT` + прогон чтений на компактированном LSM** | ✅ сделано, `TestShardedAdminCompact` зелёный; компакция чтения не ускоряет (LSM не узкое место) |
+| 10 | **Фикс write stall (FSM snapshot)** — `FSM.Snapshot` больше не сериализует состояние на FSM-горутине: быстрый пин Pebble-снапшота + сериализация в `Persist` | ✅ сделано, `TestEngineSnapshotPointInTime`/`TestEngineSnapshotKVTable`/`TestStressStallWriteLoad` зелёные; 3 стресс-прогона 0 STALL |
+| 11 | **Vectorized columnar-скан** — bulk-декод числовых колонок в плотные массивы (`numVec`), vectorized агрегаты/группировка/фильтры, счёт маркеров через `kv.RangeCount` | ✅ сделано, тесты зелёные; агрегаты ~1.6–2×, `GROUP BY` 384k→~450 allocs |
+| 12 | **Счётчик живых строк для `COUNT(*)`** — per-table счётчик, поддерживаемый в DML, `COUNT(*)` без WHERE — O(1) | ✅ сделано, `TestCStoreLiveRowCounter` зелёный |
+| 13 | **Встроенный UI (веб-консоль)** — единый бинарник: HTTP-сервер + `go:embed` фронт; консоль в стиле Yandex Cloud (Gravity UI); админка, SQL-редактор, свои дашборды, Kibana-like логи | 🚧 UI-P1 ✅ + UI-P2 ✅ + **UI-P3 (Dashboard builder) ✅**: виджеты на `@gravity-ui/charts` (line/bar/pie/stat/gauge/table/histogram/heatmap/log_viewer), перетаскиваемая сетка `react-grid-layout` v2 (drag/resize/rename/CRUD виджетов, один `PUT` на жест, авто-выравнивание коллизий), auto-refresh, hash-роутинг `#/cluster|sql|dashboards|logs`; **UI-P4 (админ-консоль) ✅**: админ-действия (SPLIT/COMPACT/FREEZE/peers) с подтверждением, экспорт в CSV, `/metrics` (Prometheus); **Log explorer**: поиск + histogram + виртуализированный список + live tail (SSE) + bulk ingest `/api/v1/ingest`; **UI-полировка ✅**: YADBGO-логотип с молнией (молния и текст выровнены по иконкам/заголовкам меню, в свёрнутом сайдбаре остаётся одна молния по центру), круглый коллапс-шеврон внизу сайдбара, фикс вечного вертикального скролла (хард-фикс высот `html/body/#root`); **UI-P5 ✅**: живые метрики на Cluster (графики requests/s и p50/p99 per-node), композитные PK-сплиты (`ADMIN SPLIT ... AT (v1, v2)` + table-level `PRIMARY KEY (a,b)` в парсере), мульти-дашборд с активным дашбордом в URL-хеше (`#/dashboards/<id>`, deep-link/back/forward работают) |
 
 ### Что дальше (roadmap)
 
+- [ ] **Встроенный UI (веб-консоль)** — консоль в стиле Yandex Cloud на Gravity UI (`@gravity-ui/uikit` + `navigation` + `charts` + `table`), Node 22 LTS:
+  - [x] SQL-функции для BI: `time_bucket(interval, ts)`, `COUNT_IF(cond)`, `NOW()`, `percentile(col, p)` (time_bucket/COUNT_IF/NOW готовы; percentile — позже)
+  - [x] `ADMIN TABLES` (список таблиц+схем+шардов из каталога) + `ADMIN METRICS-JSON` (структурированные метрики)
+  - [x] HTTP-каркас в `serve`: флаг `-http :8080`, `POST /api/v1/query|admin`, `GET /api/v1/tables|shards|nodes|metrics`, `go:embed` статика
+  - [x] Системная таблица `_dashboards` (JSON-конфиг) + CRUD `/api/v1/dashboards` + `/api/v1/widget/query` (LRU-кэш)
+  - [x] Фронт: `AsideHeader`-каркас (Cluster / SQL / Dashboards / Logs) + страницы Cluster и SQL
+  - [x] Log explorer: поиск + histogram (bar-y) + виртуализированный список + live tail (SSE, zero-deps вместо WebSocket), bulk ingest `POST /api/v1/ingest`
+  - [x] Dashboard builder: виджеты (`line/bar/pie/stat/gauge/table/histogram/heatmap/log_viewer`) на `@gravity-ui/charts`, агрегация по `time_bucket`, refresh, grid (`react-grid-layout` v2: перетаскивание/ресайз/переименование/CRUD виджетов — сохранение позиций одним `PUT /api/v1/dashboards/{id}` на жест, коллизии авто-выравниваются, правый край не выходит за контейнер; измерение ширины через `useMeasuredWidth` + `ResizeObserver`, т.к. грид монтируется после async-загрузки)
+  - [x] Админ-действия (SPLIT / COMPACT / FREEZE / peers) с подтверждением, экспорт, метрики, `/metrics` (Prometheus)
+  - [x] Полировка сайдбара: логотип `YADBGO` с бейджем-молнией (центр молнии == центр иконок меню, текст — на одной вертикали с заголовками пунктов), круглый коллапс-шеврон внизу панели (`renderFooter`), фикс вечного вертикального скролла (`html/body/#root {height:100%}`)
+  - [x] Живые метрики на Cluster: графики requests/s и p50/p99 латентности per-node на `@gravity-ui/charts` (опрос каждые 3 с, скользящее окно ~3 мин, rate из дельт счётчиков), переключатель «все узлы / конкретный узел» со статусом
+  - [x] Композитные PK-сплиты: `ADMIN SPLIT ... AT (v1, v2, ...)`, парсер `CREATE TABLE` поддерживает table-level `PRIMARY KEY (a, b)`, форма Split по PK-колонкам
+  - [x] Мульти-дашборд: переключатель дашбордов (Select), создание/удаление, активный дашборд в URL-хеше `#/dashboards/<id>` — deep-link, back/forward и выбор через UI синхронизируют хеш и контент (глубинная ссылка на несуществующий id откатывается к первому)
+  - [ ] **UI-P6** (следующая фаза): см. раздел «Фазы» ниже — виджеты на произвольных таблицах
+
 - [x] `internal/kv` — фундамент: байтовые ключи, ревизии, range/prefix, watch/CAS/lease
+- [x] Запуск из YDB-style YAML-конфига (`-config cluster.yaml`): топология кластера в одном файле, узел выбирается по `-node-id`, join выводится из файла, приоритет «явный флаг > конфиг > дефолт» (`internal/config`, `scripts/qa-config.sh`)
 - [x] Бинарные ops в raft-entry (вместо `strings.Join` SQL-текста) — `internal/sql/bincodec.go`
 - [x] `ENGINE=` в парсере/AST: `CREATE TABLE ... ENGINE=TABLE|KV|CSTORE`
 - [x] Фабрика хранилища по движку (`newStoreFor`) + `internal/kv` в качестве бэкенда для `ENGINE=KV`
@@ -29,6 +52,12 @@
 - [x] Шардовый `GROUP BY`: частичные группы считаются на каждом шарде, координатор сливает их по ключу (включая взвешенный `AVG`)
 - [x] Auto-TTL: `RETENTION = '<window>'` в `CREATE TABLE` + фоновый цикл на лидере каждого шарда (удаление через raft, идемпотентно)
 - [x] `LIKE`/`NOT LIKE` в `WHERE` для всех движков + префиксная оптимизация по строковому PK в `CSTORE`
+- [x] Вторичные индексы: `CREATE/DROP INDEX`, обслуживание в DML (remove-then-add, безопасно при raft-replay), fast-path для `=`/`LIKE` в columnar-планировщике
+- [x] Batch-insert API (`BatchInsert` через `sqlx.BatchInsertEngine`) + group-commit тюнинг (конфигурируемое адаптивное окно, idle-флаш, pipelined raft-apply)
+- [x] `ADMIN COMPACT` — forced LSM-компакция локальных сторов; прогон чтений на компактированном LSM (вывод: LSM не узкое место чтений)
+- [x] Фикс write stall: `FSM.Snapshot()` пинит Pebble-снапшот за O(1), сериализация ушла в `snapshot.Persist(sink)` на отдельной raft-горутине; вотчдог `BATCH-STALL` оставлен как диагностический предохранитель
+- [x] Vectorized columnar-скан: bulk-декод числовых колонок в плотные массивы (`colDecodeNumeric`/`numVec`), векторные `aggNumVec`/`colAccum.addNum` в агрегатах/`GROUP BY`/предикатах, `kv.RangeCount` для счёта маркеров строк (пропуск версий и tombstone через снапшот-`prev`)
+- [x] Счётчик живых строк CSTORE: per-table счётчик (тег `'n'` в engine-сторе), exact-обслуживание в `rowPut`/`rowDelete`/`rowDeleteAll` (delta копится в tx, на commit — атомарно с row-writes), пересборка при снапшот-restore; `COUNT(*)` без WHERE = O(1) чтение счётчика
 
 ## Возможности
 
@@ -173,11 +202,12 @@ METRICS`. Числа зависят от fsync-скорости диска; в �
 | `ADMIN JOIN <node-id> <meta-raft-addr>` | добавить узел в мета-группу |
 | `ADMIN REGISTER <node-id> <sql-addr> <raft-addr>` | зарегистрировать узел в каталоге |
 | `ADMIN SHARDS <table>` | список шардов таблицы: `shard,start,end,nodes,size` |
-| `ADMIN SPLIT TABLE <t> AT <pk>` | вручную разбить шард по значению PK |
+| `ADMIN SPLIT TABLE <t> AT <pk>` | вручную разбить шард по значению PK: одиночное значение (`AT 42`) или список для составного ключа (`AT (1, 'foo')`) |
 | `ADMIN FREEZE-SHARD <t> <shard>` | заморозить шард (внутреннее при сплите) |
 | `ADMIN UNFREEZE-SHARD <t> <shard>` | разморозить шард |
 | `ADMIN UNMOUNT-SHARD <t> <shard>` | закрыть и удалить локальную реплику |
 | `ADMIN SHARD-PEERS <t> <shard>` | члены группы данных (id, addr) |
+| `ADMIN COMPACT` | forced полная LSM-компакция всех локальных сторов шардов |
 | `ADMIN METRICS` | серверные счётчики + p50/p99 записи/чтения |
 
 Внутренние (используются при сборке группы и восстановлении, хендлинг
@@ -247,9 +277,12 @@ Raft-entries переносят **бинарные ops** (`sqlx.EncodeStatements
   что выгода работает и на кластере.
 - **Pushdown агрегатов** — `SELECT COUNT/SUM/MIN/MAX/AVG(...)` без
   `WHERE/GROUP BY/ORDER BY` вычисляется прямо в сторе одним проходом по
-  колонке (агрегаты по одной колонке объединяются в один скан; `COUNT(*)` —
-  счётчик маркеров строк без чтения ячеек). Такой запрос не материализует
-  строки вообще.
+  колонке (агрегаты по одной колонке объединяются в один скан). Числовые
+  колонки декодируются bulk-декодом в плотные массивы и сворачиваются
+  векторно (`colDecodeNumeric`/`aggNumVec`). `COUNT(*)` без `WHERE` — O(1)
+  чтение per-table счётчика живых строк (см. P2 ниже); `COUNT(*)` с PK-окном —
+  `kv.RangeCount` по маркерам строк без чтения ячеек. Такой запрос не
+  материализует строки вообще.
 - **Pruning по PK** — `WHERE`, который сводится к диапазону первичного ключа
   (обычный случай для логов: временное окно), превращается в границы скана
   колонок; исполнитель не читает строки вне окна, а шардированный роутер
@@ -382,6 +415,221 @@ RF сходится к исходному; при падении >половин
 где он остался в `Spec.Nodes`. Новые шарды (`CREATE TABLE`, `SPLIT`)
 размещаются только на живых узлах.
 
+## Веб-консоль (UI)
+
+Встроенный веб-интерфейс в стиле **консоли Yandex Cloud** — единый бинарник:
+`serve -http :8080` поднимает HTTP-сервер рядом с gRPC, статику фронта раздаёт
+`go:embed`. Бэкенд вызывает `Manager.Handle` in-process (никаких лишних сетевых
+хопов): `POST /api/v1/query` — произвольный SQL, `POST /api/v1/admin` — `ADMIN`
+команды, `GET /api/v1/tables|shards|nodes|metrics` — кластерная витрина,
+`POST /api/v1/ingest` — bulk-вставка логов, `GET /api/v1/tail` — live-поток
+результата запроса (SSE).
+
+Фронт: **Gravity UI** — та же дизайн-система, что у консоли Yandex Cloud
+(пакет `@yandex-cloud/uikit` переименован в `@gravity-ui/uikit`):
+`@gravity-ui/uikit` (компоненты) + `@gravity-ui/navigation` (`AsideHeader` —
+сайдбар-«полка») + `@gravity-ui/charts` (графики, включая heatmap) +
+`@gravity-ui/icons`. Таблицы — собственный лёгкий компонент `ResultTable`
+(`@gravity-ui/table` несовместим с React 19). Требуется Node 22 LTS
+(`.nvmrc`, апгрейд с 18 EOL через `nvm`).
+
+### Фазы
+
+- **UI-P1 — фундамент (готово)**: SQL-функции `time_bucket(interval, ts)`, `COUNT_IF(cond)`,
+  `NOW()` (для BI-запросов); `ADMIN TABLES` (список таблиц+схем+шардов из каталога)
+  и `ADMIN METRICS-JSON`; HTTP-каркас `/api/v1/*` + `go:embed`; системная таблица
+  `_dashboards` + CRUD + `/api/v1/widget/query` (LRU-кэш); фронт с `AsideHeader`
+  (страницы Cluster и SQL). Сборка фронта: `cd internal/ui/web && npm install && npm run build`.
+- **UI-P2 — Log explorer (готово)**: поиск по времени/тексту + histogram (bar-y
+  на `@gravity-ui/charts`, бакеты через `time_bucket`) + виртуализированный список +
+  **live tail** (SSE через `GET /api/v1/tail` — zero-зависимый транспорт вместо
+  WebSocket, EventSource сам переподключается) + bulk ingest `POST /api/v1/ingest`.
+  Метаданные таблиц (`columns` с типами и PK) доступны через `GET /api/v1/tables`.
+- **UI-P3 — Dashboard builder (готово)**: виджеты (`line/bar/pie/stat/gauge/table/
+  histogram/heatmap/log_viewer`) на `@gravity-ui/charts` (datetime/category оси,
+  time_bucket-агрегация), перетаскиваемая сетка `react-grid-layout` v2
+  (позиции персистятся), auto-refresh по интервалу, редактор виджетов
+  (тип/заголовок/SQL/размер + примеры запросов). Данные виджетов —
+  `POST /api/v1/widget/query` (LRU-кэш); конфиг дашборда (`{title,
+  refresh_interval, widgets:[{id,type,title,sql,x,y,w,h}]}`) живёт в
+  `_dashboards`. Позиции сохраняются только по `onDragStop`/`onResizeStop`
+  (один `PUT` на жест — `onLayoutChange` в RGL v2 стреляет на каждый кадр
+  жеста); коллизии авто-выравниваются vertical-компактором, двойной padding
+  контейнера устранён (правое поле впритык к контейнеру, `overflow:hidden`);
+  ширина грида меряется кастомным `useMeasuredWidth(active)` (RGL требует
+  числовой `width`, а контейнер монтируется после async-загрузки — старый
+  хук с `deps=[]` давал 0). Страницы фронта открываются по hash-роутингу
+  (`#/cluster`, `#/sql`, `#/dashboards`, `#/logs`). QA-скрипты
+  (`verify-grid.mjs`/`verify-dash.mjs`, puppeteer-core) проверяют геометрию
+  (без пересечений, без правого выхода) и что каждая операция = один `PUT`.
+- **UI-P4 — админ-консоль (готово)**: на странице **Cluster** — админ-действия с
+  диалогами подтверждения: `ADMIN COMPACT` (кластерный, в шапке), `ADMIN SPLIT
+  TABLE <t> AT <pk>` (пер-табличный и пер-шардовый, с вводом значения PK),
+  `ADMIN FREEZE/UNFREEZE-SHARD <t> <shard>`, `ADMIN SHARD-PEERS <t> <shard>`
+  (результат — таблица ID/Addr). Результат любой команды показывается в
+  диалоге (rows/note; ошибки — красным), после мутаций таблицы/шарды
+  перечитываются. **Экспорт**: кнопка Export CSV на страницах SQL и Logs
+  (`src/export.ts` — UTF-8 BOM, экранирование `",\n`, заголовок = колонки).
+  **Метрики**: `GET /metrics` — Prometheus text format из `ADMIN METRICS-JSON`
+  (per-node `ydbgo_requests_total{type=write|read}`, `ydbgo_latency_milliseconds
+  {quantile=p50|p99}`, `ydbgo_uptime_seconds`); standalone-режим тоже пишет
+  счётчики (в `internal/server` добавлен свой `nodeMetrics`).
+- **UI-P5 — метрики, продвинутые админ-операции, мульти-дашборд (план, следующий шаг — UI-P6)**:
+  - [x] **Метрики в UI**: на странице Cluster — живые графики per-node
+    (requests/s по type=write|read, p50/p99 латентность) из `/api/v1/metrics`
+    на `@gravity-ui/charts` (line, опрос каждые 3 с, скользящее окно ~3 мин,
+    rate вычисляется из дельты кумулятивных счётчиков); переключатель «все
+    узлы / конкретный узел» с индикатором статуса. Проверяется
+    `verify-metrics.mjs` (графики рендерятся, растут под нагрузкой,
+    переключатель узлов переключает данные).
+  - [x] **Композитные PK-сплиты**: `ADMIN SPLIT TABLE <t> AT (<v1>, <v2>)` для
+    составного первичного ключа — парсер принимает одиночное значение и
+    скобочный список через запятую (кавычки/запятые внутри строк учитываются),
+    валидация числа значений против схемы PK и типа каждой колонки, тип
+    timestamp теперь парсится корректно (RFC3339, граница сплита кодируется
+    типом tTimestamp, а не строкой); форма Split на Cluster — по одному полю на
+    PK-колонку с подсказкой по типу. Парсер CREATE TABLE научился различать
+    column-level `PRIMARY KEY` и table-level `PRIMARY KEY (a, b)` для
+    составного ключа. Проверяется `TestShardedCompositePKSplit` и
+    `verify-admin.mjs` (диалог с двумя полями → новый шард `kvp-0-1`).
+  - [x] **Мульти-дашборд**: переключатель дашбордов (Select) со списком из
+    `_dashboards`, создание/удаление, активный дашборд живёт в URL-хеше
+    `#/dashboards/<id>` (`src/hash.ts`: `parseDashId`/`setDashHash`). Выбор через
+    UI, deep-link и кнопки браузера (back/forward) синхронизируют хеш и контент;
+    хеш-обработчик подтягивает свежий список, если целевой id не был в кэше
+    страницы (например дашборд создан в другой вкладке), а несуществующий id
+    откатывается к первому дашборду. `App.tsx` не затирает `#/dashboards/<id>`
+    при синхронизации страницы. Проверяется `verify-dashhash.mjs` (resolve
+    первого дашборда, deep-link на второй, выбор через UI, back, bogus-id
+    fallback).
+  - [ ] **Виджеты на произвольных таблицах**: редактор виджета уже принимает
+    произвольный SQL; добавить picker таблиц/колонок (схема из
+    `/api/v1/tables`) и валидацию запроса перед сохранением.
+  - [ ] Мелкий UX: кнопка «Отменить» в редакторе дашборда, горячая клавиша
+    «Выполнить» (Ctrl/Cmd+Enter) в SQL-редакторе, история запросов.
+
+### Тестирование UI (QA-скрипты)
+
+UI проверяется не snapshot-тестами, а **реальным браузером** через
+`puppeteer-core` (devDep фронта) — headless Chrome против работающего сервера
+(`http://127.0.0.1:8080`). Причина: `--dump-dom`/SSR не дают геометрию, а
+позиции, центры и скроллы нужно мерить в рантайме.
+
+Все скрипты QA лежат в репозитории и запускаются из корня:
+
+| Скрипт | Назначение |
+|--------|------------|
+| `scripts/ui-restart.sh` | собрать фронт + бинарь и (пере)запустить демо-узел (`serve -bootstrap -rf 1`); аргументы и пути — через env (`YDBGO_BIN`, `DATA`, `SQL_ADDR`, `HTTP_ADDR`, `RAFT_ADDR`, `NODE_ID`), убийство старого инстанса отдельным шагом (иначе pkill цепляет свой же shell); если старт не прошёл (напр. каталог `DATA` под `/tmp` остался без демо-таблиц после жёсткого kill во время ресида) — данные пересоздаются и запуск повторяется один раз |
+| `scripts/reseed-demo.sh` | засеять чистые демо-данные против **работающего** сервера: таблица `logs ENGINE=CSTORE` (300 строк через `ydbgo run`, бинарь — `$YDBGO`, по умолч. `./bin/ydbgo`), пересоздать дашборд «Cluster overview», удалить старые |
+| `scripts/ui-qa.sh` | прогнать все QA-скрипты `internal/ui/web/verify-*.mjs` в заданном порядке (или один — по glob-аргументу, напр. `./scripts/ui-qa.sh 'verify-grid*'`); порядок важен: `verify-metrics` пишет в `logs` и должен идти до `verify-admin` (тот делает SPLIT и оставляет сплит-шард); каждый печатает свою строку `RESULT: OK` |
+| `scripts/qa-config.sh` | поднять двухузловой кластер из YAML-конфига (`serve -config`): bootstrap + join по топологии из файла, оба узла видны через `/api/v1/nodes`, DDL/DML/read сквозь адреса из конфига, явный `-addr` перекрывает конфиг, неизвестный `-node-id` отклоняется; свои порты/временный каталог, чужие процессы не трогает |
+| `internal/ui/web/verify-*.mjs` | отдельные проверки браузером (см. таблицу ниже) |
+
+Типовой цикл:
+
+```bash
+./scripts/ui-restart.sh          # сборка + перезапуск сервера (Node берётся через nvm)
+./scripts/reseed-demo.sh         # чистые демо-данные
+./scripts/ui-qa.sh               # все проверки
+./scripts/ui-qa.sh 'verify-grid*' # или одна конкретная
+```
+
+Важно: `verify-admin` оставляет `logs` расщеплённым, поэтому **каждый полный
+прогон `ui-qa.sh` должен предваряться `reseed-demo.sh`** — иначе повторный
+`SPLIT` того же ключа падает с 400 («split key is below shard start»).
+
+QA-скрипты (`internal/ui/web/verify-*.mjs`, запуск `node verify-<name>.mjs`,
+браузер — `$CHROME` или `/usr/bin/google-chrome`):
+
+| Скрипт | Что проверяет |
+|--------|---------------|
+| `verify-pages.mjs` | 4 страницы (`#/cluster\|sql\|dashboards\|logs`) открываются без JS-ошибок и не-favicon 404, логотип/коллапс-кнопка на месте |
+| `verify-scroll.mjs` | хард-фикс скролла: короткие страницы (sql/dashboards/logs) умещаются ровно (`scrollH == clientH`), кластер с графиками скроллится, высокая страница прокручивается (финальная проверка сама докидывает свежие строки в `logs`, т.к. демо-данные живут от начала текущего часа «вперёд» — в «1h»-окне у начала часа почти нет строк, и страница легитимно умещается в 600px) |
+| `verify-logo.mjs` | выравнивание: центр молнии == центр иконок меню, текст `YADBGO` на одной вертикали с заголовками пунктов (в развёрнутом и свёрнутом сайдбаре), коллапс-шеврон внизу (≤20px от низа панели) |
+| `verify-grid.mjs` | сетка дашборда: виджеты без пересечений, правый край впритык к контейнеру, каждый жест (resize/drag/rename) = ровно один `PUT /api/v1/dashboards/{id}`; единственный 404 — favicon |
+| `verify-dash.mjs` | **идемпотентный**: сбрасывает первый дашборд к канонической конфигурации, прогоняет drag/rename/add (каждый = ровно один PUT), геометрию без пересечений, CRUD-раундтрип через API и в конце восстанавливает исходную конфигурацию |
+| `verify-dashhash.mjs` | мульти-дашборд и URL-хеш: открытие `#/dashboards` резолвится в первый дашборд и проставляет `#/dashboards/<id>`; deep-link на созданный через API второй дашборд переключает страницу; выбор через Select обновляет хеш; кнопка back браузера возвращает хеш и контент; несуществующий id откатывается к первому (в конце удаляет свой временный дашборд) |
+| `verify-admin.mjs` | админ-действия на Cluster: SPLIT логов (появляется новый шард `logs-0-1`), SHARD-PEERS (диалог с колонками ID/Addr), композитный SPLIT таблицы `kvp` с 2 PK-колонками (форма из двух полей → шард `kvp-0-1`) + DROP в конце |
+| `verify-export.mjs` | кнопка Export CSV: headless Chrome требует `Browser.setDownloadBehavior` на browser-сессии (blob-URL download не даёт `download`-событие puppeteer), файл ищется опросом каталога `/tmp/ydbgo-dl`; проверяется UTF-8 BOM + заголовок + строки |
+| `verify-metrics.mjs` | метрики на Cluster: 4 графика рендерятся (SVG), под нагрузкой (ingest/query через API) число точек растёт, переключатель узлов переключает данные, нет JS-ошибок |
+
+Дополнительно: `go test ./...` (в т.ч. `TestUIPromMetrics` — формат
+`GET /metrics`) и ручная проверка визуала через скриншоты, которые делают
+QA-скрипты (`/tmp/ui-*.png`).
+
+### Запуск и API
+
+```bash
+go build -o ydbgo ./cmd/ydbgo
+# единый бинарник: SQL + raft + HTTP-консоль
+./ydbgo serve -addr 127.0.0.1:2135 -data ./data -http :8080 \
+  -raft-addr 127.0.0.1:7001 -node-id n1 -bootstrap -rf 1
+# открыть http://localhost:8080
+```
+
+#### Конфигурация кластера (YAML)
+
+Кластер описывается одним YDB-style YAML-файлом (см. `examples/cluster.yaml`);
+узел находит себя по `-node-id`, адреса/каталог/join берутся из файла,
+явные флаги перекрывают файл:
+
+```yaml
+config:
+  hosts:
+  - {host: 127.0.0.1, grpc: 2135, raft: 7001, data: ./ydbgo-data, id: n1, bootstrap: true}
+  - {host: 127.0.0.1, grpc: 2136, raft: 7002, data: ./ydbgo-n2, id: n2}
+```
+
+```bash
+./ydbgo serve -config examples/cluster.yaml -node-id n1   # bootstrap-узел
+./ydbgo serve -config examples/cluster.yaml -node-id n2   # join — из файла
+./ydbgo run  -config examples/cluster.yaml "ADMIN TABLES" # addr = bootstrap-узел
+```
+
+Правила:
+- **Приоритет: явный флаг > config-файл > встроенный дефолт.** Не заданные на CLI
+  значения подставляются из записи хоста (`addr←host:grpc`, `data`, `raft-addr`,
+  `node-id`, `bootstrap`), а не-bootstrap-узлу — `join = grpc` bootstrap-хоста.
+- `http`, `pprof`, `rf`, `shard-size`, `split-check`, `recovery-check`, `ttl-tick`
+  в конфиге отсутствуют и задаются только флагами.
+- Валидация при загрузке: ≥1 хост, уникальные `id`, корректные порты, `host`
+  по умолчанию `127.0.0.1`, ровно один `bootstrap: true`; неизвестные ключи —
+  ошибка.
+- `run`/`repl`/`bench -config` используют адрес bootstrap-узла как `-addr` по
+  умолчанию.
+
+```bash
+# произвольный SQL
+curl -s -X POST localhost:8080/api/v1/query -d '{"sql":"SELECT * FROM logs"}'
+# ADMIN-команды
+curl -s -X POST localhost:8080/api/v1/admin -d '{"cmd":"ADMIN TABLES"}'
+# кластерная витрина
+curl -s localhost:8080/api/v1/tables | python3 -m json.tool
+curl -s localhost:8080/api/v1/shards?table=logs
+curl -s localhost:8080/api/v1/nodes
+curl -s localhost:8080/api/v1/metrics
+# Prometheus text format (per-node counters/gauges)
+curl -s localhost:8080/metrics
+# админ-действия из UI: ADMIN COMPACT / SPLIT / FREEZE / SHARD-PEERS
+curl -s -X POST localhost:8080/api/v1/admin -d '{"cmd":"ADMIN COMPACT"}'
+curl -s -X POST localhost:8080/api/v1/admin -d '{"cmd":"ADMIN SHARD-PEERS logs logs-0"}'
+curl -s -X POST localhost:8080/api/v1/admin -d '{"cmd":"ADMIN SPLIT TABLE logs AT 2026-08-17T15:00:00Z"}'
+# bulk ingest логов (ячейки: string/number/bool/null)
+curl -s -X POST localhost:8080/api/v1/ingest -d '{
+  "table":"logs",
+  "columns":["ts","level","msg"],
+  "rows":[["2026-08-17T10:00:00Z","INFO","started"],["2026-08-17T10:05:00Z","ERROR","boom"]]
+}'
+# live tail (SSE): результат запроса каждые N секунд
+curl -s -N "localhost:8080/api/v1/tail?interval=2&sql=SELECT%20*%20FROM%20logs%20ORDER%20BY%20ts%20DESC%20LIMIT%205"
+# дашборды: CRUD + запрос виджета (TTL-кэш 5с)
+curl -s -X POST localhost:8080/api/v1/dashboards -d '{
+  "name":"Demo","config":{"title":"Demo","refresh_interval":30,"widgets":[
+    {"id":"w1","type":"line","title":"Logs/5m","sql":"SELECT time_bucket('\''5m'\'', ts) AS t, COUNT(*) FROM logs GROUP BY 1","x":0,"y":0,"w":6,"h":6}
+  ]}}'
+curl -s -X POST localhost:8080/api/v1/widget/query -d '{"sql":"SELECT COUNT(*) FROM logs","ttl":5}'
+```
+
 ## Тесты
 
 ```bash
@@ -459,29 +707,30 @@ RF=3. etcd гоняется тем же клиентским скриптом (�
 
 | Система | Топология | p50 | p99 | rows/s |
 |---------|-----------|-----|-----|--------|
-| **ydbgo CSTORE** | 5-узловой, RF=3 | **~33ms** | **~58ms** | **~34k** |
+| **ydbgo CSTORE** | 5-узловой, RF=3 | **~32ms** | **~54ms** | **~48k** |
 | ClickHouse 25.3 | single-node, MergeTree | ~24ms | ~41ms | ~65k |
 
 Чтения (client-side, на запрос):
 
 | Запрос | ClickHouse p50/p99 | ydbgo CSTORE p50/p99 |
 |--------|--------------------|----------------------|
-| `COUNT(*)` | 7.7 / 11.7ms | 95.6 / 135.6ms |
-| `SUM, AVG(lat)` | 16.4 / 19.0ms | 160.5 / 170.8ms |
-| окно `[03:00,04:00)` | 14.8 / 16.8ms | 49.6 / 58.4ms |
-| `GROUP BY level` | 23.8 / 28.1ms | 474.4 / 527.7ms |
-| `level LIKE 'erro%'` | 23.1 / 30.0ms | 992.4 / 1112.7ms |
-| `ORDER BY ts DESC LIMIT 10` | 9.3 / 11.1ms | 780.1 / 780.1ms |
+| `COUNT(*)` | 7.7 / 11.7ms | 41.7 / 58.8ms |
+| `SUM, AVG(lat)` | 16.4 / 19.0ms | 51.7 / 57.6ms |
+| окно `[03:00,04:00)` | 14.8 / 16.8ms | 17.6 / 20.6ms |
+| `GROUP BY level` | 23.8 / 28.1ms | 143.2 / 168.1ms |
+| `level LIKE 'erro%'` | 23.1 / 30.0ms | 77.6 / 85.2ms |
+| `ORDER BY ts DESC LIMIT 10` | 9.3 / 11.1ms | **1.7 / 2.2ms** |
 
 Результаты всех запросов **идентичны** обеим системам (count 192 000, сумма
 9 593 506.08, окно 36 000 строк, `GROUP BY`: info 115 284 / warn 47 871 /
 error 28 845, LIKE 28 845). Вывод честный: по записи ydbgo отстаёт ~2× — но это
 с учётом raft-репликации на 5 узлов (RF=3), при этом один raft-entry на батч
-вместо per-row. По чтению ClickHouse впереди на порядок на сканах/агрегациях
-(SIMD-векторизация, потоковая колоночная обработка и прунинг по гранулам);
-`LIKE` и `ORDER BY` у нас особенно дороги (полный скан без вторичных индексов и
-полная сортировка). Это — дорожная карта: вторичные индексы, векторный
-executor, прунинг гранул.
+вместо per-row. По чтению ClickHouse впереди на сканах/агрегациях (SIMD-векторизация,
+потоковая колоночная обработка и прунинг по гранулам); особенно дорог у нас
+`GROUP BY` (полный скан без вторичных индексов), а `LIKE` уже закрыт
+columnar-предикатом (см. план ниже). `ORDER BY ... LIMIT` закрыт обратным
+PK-сканом. Вторичные индексы теперь реализованы (см. ниже); дорожная карта —
+векторный executor и прунинг гранул.
 
 #### 5-узловой кластер ClickHouse, RF=3
 
@@ -496,28 +745,30 @@ executor, прунинг гранул.
 
 | Система | Топология | p50 | p99 | rows/s |
 |---------|-----------|-----|-----|--------|
-| **ydbgo CSTORE** | 5-узловой, RF=3 | **~33ms** | **~58ms** | **~34k** |
+| **ydbgo CSTORE** | 5-узловой, RF=3 | **~32ms** | **~54ms** | **~48k** |
 | ClickHouse 25.3 | 5-узловой, RF=3 | ~209ms | ~332ms | ~7.5k |
 
 Чтения (client-side, на запрос):
 
 | Запрос | ClickHouse p50/p99 | ydbgo CSTORE p50/p99 |
 |--------|--------------------|----------------------|
-| `COUNT(*)` | 21.0 / 65.3ms | 95.6 / 135.6ms |
-| `SUM, AVG(lat)` | 36.3 / 47.0ms | 160.5 / 170.8ms |
-| окно `[03:00,04:00)` | 41.1 / 54.4ms | 49.6 / 58.4ms |
-| `GROUP BY level` | 50.7 / 70.9ms | 474.4 / 527.7ms |
-| `level LIKE 'erro%'` | 41.3 / 55.7ms | 992.4 / 1112.7ms |
-| `ORDER BY ts DESC LIMIT 10` | 35.6 / 65.6ms | 780.1 / 780.1ms |
+| `COUNT(*)` | 21.0 / 65.3ms | 41.7 / 58.8ms |
+| `SUM, AVG(lat)` | 36.3 / 47.0ms | 51.7 / 57.6ms |
+| окно `[03:00,04:00)` | 41.1 / 54.4ms | 17.6 / 20.6ms |
+| `GROUP BY level` | 50.7 / 70.9ms | 143.2 / 168.1ms |
+| `level LIKE 'erro%'` | 41.3 / 55.7ms | 77.6 / 85.2ms |
+| `ORDER BY ts DESC LIMIT 10` | 35.6 / 65.6ms | **1.7 / 2.2ms** |
 
 Результаты идентичны (192 000 строк, окно 36 000, `GROUP BY`: info 115 284 /
 warn 47 871 / error 28 845). Вывод: при RF=3 с кворумной репликацией
 ClickHouse на записи **медленнее нашей raft-записи в ~6× по p50** (ZK-
 репликация + `insert_quorum` стоит двух сетевых раундов с подтверждениями на
-партию), по чтению колоночный движок по-прежнему впереди в 1.2–24×, но на
-окне разрыв исчезает (41ms против 49ms) — наш window-скан с прунингом по PK
-почти догнал; `GROUP BY`, `LIKE` и `ORDER BY` остаются не в нашу пользу
-(полный скан без вторичных индексов и полная сортировка).
+партию), по чтению колоночный движок по-прежнему впереди на сканах/агрегациях
+(1.2–9×), но на окне разрыв исчезает (41ms против 45ms) — наш window-скан с
+прунингом по PK почти догнал, `ORDER BY ... LIMIT` теперь **быстрее CH**
+(1.7ms против 35.6ms) за счёт bounded-скана PK-индекса; `LIKE` (78ms против
+41ms, 1.9×) и `GROUP BY` (143ms против 51ms, 2.8×) закрыты columnar-предикатом
+и inline-hash группировкой, `COUNT`/`SUM`/`AVG` (42–52ms) — bulk-декодом.
 
 Запуск сравнения:
 
@@ -534,17 +785,149 @@ go run ./cmd/benchcol -nodes http://127.0.0.1:8120,http://127.0.0.1:8121,http://
 ### План оптимизаций по итогам сравнения
 
 Разрывы с ClickHouse (5n RF=3) по p50: запись у нас быстрее в ~6×, окно почти
-паритет (1.2×), полные сканы без индекса — главные потери: `GROUP BY` 9.4×,
-`LIKE` 24×, `ORDER BY` 22×; `COUNT`/`SUM` ~4.5× за счёт per-row декода.
+паритет (1.1×), полные сканы без индекса — главные потери: `GROUP BY` 2.8×,
+`COUNT`/`SUM` 2.5–3×; `LIKE` закрыт (1.9×) и `ORDER BY`
+уже в нашу пользу (0.05×).
 
 | Tier | Оптимизация | Сейчас | Цель |
 |------|-------------|--------|------|
-| 1 | `ORDER BY pk DESC LIMIT N` — обратный PK-скан, ранний выход | 780ms | ~5–20ms |
-| 1 | `LIKE` — columnar префиксный матч без per-row контекстов | 992ms | ~60–100ms |
-| 1 | `GROUP BY` — групповой columnar-агрегат (inline hash по level) | 474ms | ~100–150ms |
-| 2 | `COUNT`/`SUM`/`AVG` — bulk-декод колонок без per-row map | 95–160ms | ~30–60ms |
-| 3 | Batch-insert API, тюнинг group-commit | 33ms | меньше |
-| 4 | Прогон чтений на compacted LSM (сейчас fresh-state, амплификация ~2–3×) | — | честнее |
+| 1 | ✅ `ORDER BY pk DESC LIMIT N` — обратный PK-скан, ранний выход | 780ms → **~1.7ms** | ~5–20ms ✅ |
+| 1 | ✅ `LIKE`/`=` по не-PK колонке — columnar предикатный скан/агрегат | 992ms → **~78ms** | ~60–100ms ✅ |
+| 1 | ✅ `GROUP BY` — групповой columnar-агрегат (inline hash по level) | 474ms → **~143ms** | ~100–150ms ✅ |
+| 2 | ✅ `COUNT`/`SUM`/`AVG` — bulk-декод колонок без per-row reader/map | 95–160ms → **~42–52ms** | ~30–60ms ✅ |
+| 3 | ✅ Batch-insert API + тюнинг group-commit (адаптивное окно, idle-флаш, pipelined raft-apply) | 32ms → **~21ms (p50, 8 клиентов)** | меньше ✅ |
+| 4 | ✅ Прогон чтений на compacted LSM (forced `ADMIN COMPACT`) | без изменения | LSM — не узкое место ✅ |
+| P0 | ✅ Фикс write stall: `FSM.Snapshot` не блокирует FSM-горутину (пин + `Persist`) | 4–24 STALL → **0** (3 прогона) | 0 STALL ✅ |
+| P1 | ✅ Vectorized columnar-скан (bulk-декод, `kv.RangeCount`) | agg 135–146ms → **~62–90ms**; `GROUP BY` 384k→~450 allocs | меньше ✅ |
+| P2 | ✅ `COUNT(*)` без WHERE — счётчик живых строк | 52ms (rangecount) → **O(1) чтение счётчика** | O(1) ✅ |
+
+Реализовано (Tier 1, пункт 1): `ORDER BY PK ... LIMIT N` больше не сканирует
+всю таблицу и не сортирует — это bounded-скан обратного PK-индекса с ранним
+выходом (`internal/kv.RangeDesc` → `storage.ScanTopN` → пушдаун в sql-executor
+и per-shard `ORDER BY ... LIMIT` в роутере). Замер на 5-узловом кластере RF=3
+в том же workload: **780ms → ~1.8ms (p50)** — быстрее ClickHouse 5n RF=3
+(35.6ms). Parity сохраняется (192 000 строк, окно 36 000).
+
+Реализовано (Tier 1, пункт 2): `WHERE level LIKE 'erro%'` / `level = 'x'` по
+не-PK колонке больше не материализует строки и не строит per-row контексты.
+Новый планировщик `sql.PlanWhere` раскладывает `WHERE` на PK-диапазон + один
+предикат по не-PK колонке (равенство или LIKE с ведущим литералом); в storage
+добавлены columnar `ColumnCountFiltered` / `ColumnAggregatesFiltered` /
+`ScanColumnsFiltered`, которые сканируют колонку-предикат (keep-маска) и
+считают/агрегируют/выдают только совпавшие позиции. `COUNT(*) ... LIKE` и
+агрегаты пушдаунятся на шарды без пересылки строк. Замер: **992ms → ~78ms
+(p50)**.
+
+Реализовано (Tier 1, пункт 3): `GROUP BY <col>` по одной колонке больше не
+строит per-row ключ (быстрый `EncodePK` с `bytes.Buffer` на строку) и не
+материализует массивы ячеек. `storage.ColumnGroupedAggregates` хеширует сырые
+байты ячейки группы прямо в скане (`maphash`, `map[uint64]*grp` с коллизионным
+fallback по `bytes.Equal`), значение группы декодируется только для новой
+группы, а агрегатные колонки аккумулируются в ранговом порядке за один скан
+на колонку (SUM+COUNT одной колонки делят один скан). Аккумуляторы — битмаска
+без per-row map-lookup. Плюс zero-copy-скан (`kv.RangeNoCopy`) и замена
+per-key `SeekGE` на последовательный `Next()` в latest-revision-пути `kv.Range`
+— это ускорило все columnar-чтения. Замер: **474ms → ~143ms (p50)** на том же
+workload; parity сохраняется (info 115 284 / warn 47 871 / error 28 845).
+
+Реализовано (Tier 2): `COUNT(*)`, `COUNT/SUM/MIN/MAX/AVG(col)` и их варианты с
+предикатом больше не строят per-row reader/аккумулятор. `ColumnAggregates` /
+`ColumnAggregatesFiltered` декодируют числовые колонки напрямую из сырых байтов
+ячейки (`decodeNumericCell` для tInt/tFloat/tTimestamp: `[type][null][zigzag-
+varint]` без `makeReader`), аккумулируя в inline-переменных по битмаске флагов;
+`COUNT(*)` сканирует только PK (значение колонки не читается, zero-copy).
+Замер: **95–160ms → ~42–52ms (p50)**; `LIKE`-агрегаты тоже ускорились (~78ms).
+
+Реализовано (вторичные индексы): `CREATE INDEX [IF NOT EXISTS] name ON t (col)`
+и `DROP INDEX [IF EXISTS] name [ON t]` (одна колонка; композитные пока
+отклоняются). Индекс — производная структура: определение персистится в
+схеме таблицы, а записи (encoded-значение → pks) живут в памяти, перестраиваются
+из строк при открытии/восстановлении снапшота и поддерживаются инкрементально
+каждой DML-операцией (insert/update/delete/overwrite — идемпотентный
+remove-then-add, безопасный при raft-replay). На шарде DDL транслируется в
+raft-группу шарда (`ddlCreateIndex`/`ddlDropIndex`), поэтому каждый шард строит
+свой локальный индекс. `=`-предикат по индексной колонке — один map-hit;
+leading-literal `LIKE` — префиксный скан по немногим distinct-значениям;
+результат точечно читает ячейки колонок. Null не индексируется. Замер
+(10k строк, CSTORE): equality/LIKE `COUNT(*)` **~4.5ms → ~60µs (p50)**, аллокации
+30k → 1k.
+
+Реализовано (Tier 3): `BatchInsert(table, rows)` — многие строки одной таблицы
+записываются в одной транзакции (один write-lock, один store-commit, общий
+per-row индексный maintenance; в raft-FSM это превращает N `Put` в один проход).
+`sql.Executor` нормализует все строки `INSERT` и вызывает batch-путь через
+опциональный интерфейс `sqlx.BatchInsertEngine` (fallback на per-row Insert).
+На engine-уровне batch100/1000 быстрее ~1.5× (0.68ms против 1.00ms; 6.3ms против
+9.7ms на 1000 строк). Group-commit: окно и лимит батча настраиваются через
+`YDBGO_BATCH_WINDOW_MS`/`YDBGO_BATCH_MAXOPS`/`YDBGO_BATCH_HARD_WINDOW_MS`;
+адаптивное quiet-gap окно держит батч открытым, пока идут соседние записи;
+одиночная запись (пустая очередь) применяется сразу, без искусственной задержки;
+raft-apply больше не блокирует флаш-цикл (батчи пипелятся, кворум/fsync
+соседних entry перекрываются). Замер на 5-узловом кластере RF=3, один шард,
+conc=8, 200 строк/стейтмент: **~60k → ~66k rows/s**, p50 **~21ms** (клиент);
+одиночный клиент — p50 ~5ms (это потолок raft-круга с fsync на 3 репликах;
+`fileLogStore` синкается на каждый entry, сериализуя append).
+
+Реализовано (Tier 4): добавлен `ADMIN COMPACT` — forced полная Pebble LSM-
+компакция всех локальных стора шардов (`Engine.CompactLSM` → `db.Compact` по
+фактическому диапазону ключей). Контролируемый замер на 5-узловом кластере RF=3
+(CSTORE, 700k строк, данные на `/dev/shm`): после загрузки большой шард держит
+40–53 коротких L0-SSTable (мемтебл переполнен), после `ADMIN COMPACT` — 17
+(таблицы слиты, мемтебл спущен на диск). Чтения до/после (p50, 100 прогонов):
+
+| Запрос | fresh-state (memtable+L0) | после COMPACT |
+|--------|---------------------------|---------------|
+| `COUNT(*)` | 170ms | 250–350ms |
+| `SUM, AVG(lat)` | 217ms | 288–382ms |
+| окно `[03:00,04:00)` | 22.6ms | 28–30ms |
+| `GROUP BY level` | 733ms | 700–725ms |
+| `level LIKE 'erro%'` | 321ms | 374–389ms |
+| `ORDER BY ts DESC LIMIT 10` | 1.9ms | 1.8–1.9ms |
+
+Вывод: компакция чтения **не ускоряет** (полные сканы даже чуть медленнее из-за
+спуска мемтебла на диск) — чтения упираются в columnar-декод и scatter/gather
+по шардам, а не в LSM-амплификацию. Табличные числа выше (п. 1–3) честные и не
+зависят от свежести LSM. При масштабе README-ворклоада (192k строк, ~28MB на
+шард) данные вообще живут в мемтебле (0–3 SSTable), так что "амплификация 2–3×"
+там отсутствует.
+
+Реализовано (P0, фикс write stall): корень stall — `FSM.Snapshot()` синхронно
+сериализовал состояние (`MarshalState`) на raft-FSM-горутине; тяжёлая
+сериализация блокировала `runFSM`, фолловеры не отвечали, лидер терял кворум,
+raft-future висели и клиенты упирались в таймаут. Теперь `Snapshot()` только
+пинит Pebble-снапшоты всех сторов (`CaptureSnapshot`, O(1) под `db.NewSnapshot`),
+а сериализация ушла в `snapshot.Persist(sink)` на отдельной raft-горутине.
+В `kv` добавлены типы `Snapshot`/`iterSource`, рефакторинг `rangeIter`;
+`kvTx`/`cstoreTx` держат пин и читают через него; `rollback` освобождает пин.
+Вотчдог `BATCH-STALL` в `internal/raftsvc/batch.go` оставлен как диагностический
+предохранитель (спит в норме). Валидация: `TestEngineSnapshotPointInTime`/
+`TestEngineSnapshotKVTable` (пин точен), 3 стресс-прогона `TestStressStallWriteLoad`
+— **0 STALL** (было 4–24), полный `go test ./...` зелёный.
+
+Реализовано (P1, vectorized скан): числовые колонки декодируются не per-row
+reader'ом, а bulk-декодом сырых байт ячейки в плотные массивы
+(`colDecodeNumeric` → `numVec` с int/float-массивами и nulls-битмаской);
+агрегаты `COUNT/SUM/MIN/MAX/AVG` и `GROUP BY` сворачивают эти массивы
+векторно (`aggNumVec`, `colAccum.addNum`), без per-row map/reader и per-cell
+аллокаций. Счёт маркеров строк (`COUNT(*)` с диапазоном, окна) переведён на
+`kv.RangeCount`: distinct-ключи считаются через снапшот-`prev` (пропуск
+старых ревизий) и tombstone-фильтр, без материализации ключей. Замеры
+(192k строк, in-process, `internal/storage/vec_bench_test.go`):
+`SUM` int 146→~62–90ms, `SUM` float 135→~63–89ms (~1.6–2×), `GROUP BY`
+162→~138ms при 384k→~450 allocs; `COUNT(*)` в окне через `RangeCount` ~40ms
+(closure-сверка). Тесты kv/storage/sql/shard/raftsvc зелёные.
+
+Реализовано (P2, счётчик `COUNT(*)`): у каждой CSTORE-таблицы в её engine-сторе
+живёт счётчик живых строк (ключ с тегом `'n'`, 8 байт BE int64), обновляемый
+атомарно с row-записями в том же `kv.Apply`. `rowPut`/`rowDelete` ведут точный
+existence-счёт (перезапись существующего PK не инкрементит, `rowDeleteAll`/
+`DROP TABLE` сбрасывает); дельты копятся в транзакции и на `commit` складываются
+с коммиченным значением (изоляция overlay даёт read-your-writes и в груп-
+коммитном батче). Счётчик пересобирается из строк при снапшот-restore, поэтому
+raft-snapshot/`ReplaceState` не ломают его. `COUNT(*)` без WHERE читает счётчик
+за O(1) (rangecount-скан был 52ms); `COUNT` с PK-окном по-прежнему использует
+`kv.RangeCount`. Проверка: `TestCStoreLiveRowCounter` (insert/dup/delete/update
+со сменой и без смены PK/batch/drop/recreate), полный `go test ./...` зелёный.
 
 Статус каждого пункта фиксируется по мере реализации; замеры обновляются в
 таблицах выше.

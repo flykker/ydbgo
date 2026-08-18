@@ -13,6 +13,11 @@ type store interface {
 	begin() (storeTx, error)
 	// view runs fn inside a read-only snapshot transaction.
 	view(fn func(tx storeTx) error) error
+	// snapshot captures a point-in-time read-only transaction that stays valid
+	// after the call returns (unlike view). The caller must release it via
+	// rollback when done. Used by the raft FSM snapshot path so serialization
+	// can run on the snapshot writer goroutine without blocking applies.
+	snapshot() (storeTx, error)
 }
 
 // storeTx is a transaction-scoped handle over the backend.

@@ -39,13 +39,14 @@ var (
 )
 
 type opts struct {
-	ch      string
-	ydb     string
-	nodes   string
-	stmts   int
-	rows    int
-	clients int
-	reads   int
+	ch        string
+	ydb       string
+	nodes     string
+	stmts     int
+	rows      int
+	clients   int
+	reads     int
+	readsOnly bool
 }
 
 type latAgg struct {
@@ -93,6 +94,7 @@ func main() {
 	flag.IntVar(&o.rows, "rows", 200, "rows per INSERT statement")
 	flag.IntVar(&o.clients, "clients", 8, "write concurrency")
 	flag.IntVar(&o.reads, "reads", 100, "repetitions per read query")
+	flag.BoolVar(&o.readsOnly, "reads-only", false, "skip setup and writes; measure reads on the existing table")
 	flag.Parse()
 
 	var nodes []string
@@ -153,6 +155,9 @@ func main() {
 
 	// setup: drop + create on each system (cluster tables are pre-created)
 	for _, s := range systems {
+		if o.readsOnly {
+			break
+		}
 		if s.chCluster {
 			continue
 		}
@@ -189,49 +194,51 @@ func main() {
 		agg  latAgg
 	}
 	var wr []*writeRes
-	for _, s := range systems {
-		w := &writeRes{name: s.name}
-		wr = append(wr, w)
-		var next int64
-		var wg sync.WaitGroup
-		start := time.Now()
-		for c := 0; c < o.clients; c++ {
-			wg.Add(1)
-			go func(exec func(string) (string, error), cluster bool) {
-				defer wg.Done()
-				for {
-					stmt := atomic.AddInt64(&next, 1) - 1
-					if stmt >= int64(o.stmts) {
-						return
+	if !o.readsOnly {
+		for _, s := range systems {
+			w := &writeRes{name: s.name}
+			wr = append(wr, w)
+			var next int64
+			var wg sync.WaitGroup
+			start := time.Now()
+			for c := 0; c < o.clients; c++ {
+				wg.Add(1)
+				go func(exec func(string) (string, error), cluster bool) {
+					defer wg.Done()
+					for {
+						stmt := atomic.AddInt64(&next, 1) - 1
+						if stmt >= int64(o.stmts) {
+							return
+						}
+						base := int(stmt) * o.rows
+						t0 := time.Now()
+						var err error
+						switch {
+						case cluster:
+							// route the whole batch to one shard (like ydbgo routes
+							// rows to their owning shard); ReplicatedMergeTree plus
+							// insert_quorum=2 replicates to a 2-of-3 quorum.
+							shard := int(stmt) % len(nodes)
+							q := fmt.Sprintf("INSERT INTO logs_%d FORMAT TabSeparated", shard)
+							u := nodes[shard] + "/?query=" + url.QueryEscape(q) + "&insert_quorum=2&default_format=TabSeparated"
+							err = chPost(u, chBatch(base, o.rows))
+						case s.name == "ClickHouse":
+							_, err = chExec(o.ch, "INSERT INTO logs FORMAT TabSeparated", chBatch(base, o.rows))
+						default:
+							_, err = exec(ydbBatch(base, o.rows))
+						}
+						if err != nil {
+							fmt.Printf("[%s] write: %v\n", s.name, err)
+							os.Exit(1)
+						}
+						w.agg.add(time.Since(t0))
 					}
-					base := int(stmt) * o.rows
-					t0 := time.Now()
-					var err error
-					switch {
-					case cluster:
-						// route the whole batch to one shard (like ydbgo routes
-						// rows to their owning shard); ReplicatedMergeTree plus
-						// insert_quorum=2 replicates to a 2-of-3 quorum.
-						shard := int(stmt) % len(nodes)
-						q := fmt.Sprintf("INSERT INTO logs_%d FORMAT TabSeparated", shard)
-						u := nodes[shard] + "/?query=" + url.QueryEscape(q) + "&insert_quorum=2&default_format=TabSeparated"
-						err = chPost(u, chBatch(base, o.rows))
-					case s.name == "ClickHouse":
-						_, err = chExec(o.ch, "INSERT INTO logs FORMAT TabSeparated", chBatch(base, o.rows))
-					default:
-						_, err = exec(ydbBatch(base, o.rows))
-					}
-					if err != nil {
-						fmt.Printf("[%s] write: %v\n", s.name, err)
-						os.Exit(1)
-					}
-					w.agg.add(time.Since(t0))
-				}
-			}(s.exec, s.chCluster)
+				}(s.exec, s.chCluster)
+			}
+			wg.Wait()
+			w.wall = time.Since(start)
 		}
-		wg.Wait()
-		w.wall = time.Since(start)
-	}
+	} // end if !o.readsOnly
 
 	// read phase
 	readQueries := func(name string, cluster bool) []string {
@@ -290,32 +297,44 @@ func main() {
 	for _, w := range wr {
 		order = append(order, w.name)
 	}
+	if len(order) == 0 {
+		// reads-only run: derive the system list from the read results
+		seen := map[string]bool{}
+		for _, r := range rr {
+			if !seen[r.sys.name] {
+				seen[r.sys.name] = true
+				order = append(order, r.sys.name)
+			}
+		}
+	}
 	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
 	byName := map[string]*writeRes{}
 	for _, w := range wr {
 		byName[w.name] = w
 	}
-	fmt.Println("== write (per-statement client-side latency) ==")
-	fmt.Printf("%-14s", "system")
-	for _, n := range order {
-		fmt.Printf(" %18s", n)
+	if len(wr) > 0 {
+		fmt.Println("== write (per-statement client-side latency) ==")
+		fmt.Printf("%-14s", "system")
+		for _, n := range order {
+			fmt.Printf(" %18s", n)
+		}
+		fmt.Println()
+		fmt.Printf("%-14s", "p50")
+		for _, n := range order {
+			fmt.Printf(" %18s", ms(byName[n].agg.pct(0.5)))
+		}
+		fmt.Println()
+		fmt.Printf("%-14s", "p99")
+		for _, n := range order {
+			fmt.Printf(" %18s", ms(byName[n].agg.pct(0.99)))
+		}
+		fmt.Println()
+		fmt.Printf("%-14s", "rows/s")
+		for _, n := range order {
+			fmt.Printf(" %18s", fmt.Sprintf("%.0f", float64(total)/byName[n].wall.Seconds()))
+		}
+		fmt.Println()
 	}
-	fmt.Println()
-	fmt.Printf("%-14s", "p50")
-	for _, n := range order {
-		fmt.Printf(" %18s", ms(byName[n].agg.pct(0.5)))
-	}
-	fmt.Println()
-	fmt.Printf("%-14s", "p99")
-	for _, n := range order {
-		fmt.Printf(" %18s", ms(byName[n].agg.pct(0.99)))
-	}
-	fmt.Println()
-	fmt.Printf("%-14s", "rows/s")
-	for _, n := range order {
-		fmt.Printf(" %18s", fmt.Sprintf("%.0f", float64(total)/byName[n].wall.Seconds()))
-	}
-	fmt.Println()
 
 	// report: reads
 	fmt.Println("\n== read (client-side latency, single query) ==")

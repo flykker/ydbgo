@@ -10,7 +10,10 @@ import (
 	sqlx "ydbgo/internal/sql"
 )
 
-var _ sqlx.Engine = (*Engine)(nil)
+var (
+	_ sqlx.Engine            = (*Engine)(nil)
+	_ sqlx.BatchInsertEngine = (*Engine)(nil)
+)
 
 // CreateTable implements sqlx.Engine.
 func (e *Engine) CreateTable(s *sqlx.TableSchema) error {
@@ -139,10 +142,67 @@ func (e *Engine) Put(name string, vals map[string]sqlValue) error {
 	if err != nil {
 		return err
 	}
-	key := schemaKey(t, vals)
 	return e.writeTo(e.store(t.engine), func(tx storeTx) error {
-		return tx.rowPut(t.name, []byte(key), encodeRow(vals, t))
+		return putRow(t, tx, vals)
 	})
+}
+
+// putRow writes one row inside an open transaction, maintaining index entries.
+// An overwrite replaces the previous row: its old index entries are dropped
+// before the new value is indexed (idempotent under raft replay).
+func putRow(t *table, tx storeTx, vals map[string]sqlValue) error {
+	key := schemaKey(t, vals)
+	if len(t.indexes) > 0 {
+		old, err := tx.rowGet(t.name, []byte(key))
+		if err != nil {
+			return err
+		}
+		if len(old) > 0 {
+			ov, err := decodeRow(old, t)
+			if err != nil {
+				return err
+			}
+			removeRowIndexes(t, ov, key)
+		}
+	}
+	if err := tx.rowPut(t.name, []byte(key), encodeRow(vals, t)); err != nil {
+		return err
+	}
+	addRowIndexes(t, vals, key)
+	return nil
+}
+
+// BatchInsert inserts many rows of one table inside a single transaction (one
+// write lock, one store commit), sharing the per-row index maintenance. It
+// implements sqlx.BatchInsertEngine.
+func (e *Engine) BatchInsert(table string, rows []map[string]sqlx.Value) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	unlock := e.writeLock()
+	defer unlock()
+	t, err := e.getTable(table)
+	if err != nil {
+		return 0, err
+	}
+	var affected int64
+	err = e.writeTo(e.store(t.engine), func(tx storeTx) error {
+		for _, row := range rows {
+			sv := make(map[string]sqlValue, len(row))
+			for k, v := range row {
+				sv[k] = fromSQLValue(v)
+			}
+			if err := putRow(t, tx, sv); err != nil {
+				return err
+			}
+			affected++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
 }
 
 // Update implements sqlx.Engine.
@@ -174,17 +234,26 @@ func (e *Engine) Update(table string, pkValues []sqlx.Value, set map[string]sqlx
 	if old == nil {
 		return nil
 	}
-	for k, v := range set {
-		old[k] = fromSQLValue(v)
+	merged := make(map[string]sqlValue, len(old)+len(set))
+	for k, v := range old {
+		merged[k] = v
 	}
-	newKey := schemaKey(t, old)
+	for k, v := range set {
+		merged[k] = fromSQLValue(v)
+	}
+	newKey := schemaKey(t, merged)
+	removeRowIndexes(t, old, pkKey)
 	return e.writeTo(st, func(tx storeTx) error {
 		if newKey != pkKey {
 			if err := tx.rowDelete(t.name, []byte(pkKey)); err != nil {
 				return err
 			}
 		}
-		return tx.rowPut(t.name, []byte(newKey), encodeRow(old, t))
+		if err := tx.rowPut(t.name, []byte(newKey), encodeRow(merged, t)); err != nil {
+			return err
+		}
+		addRowIndexes(t, merged, newKey)
+		return nil
 	})
 }
 
@@ -200,8 +269,23 @@ func (e *Engine) Delete(table string, pkValues []sqlx.Value) error {
 	for i, v := range pkValues {
 		key[i] = fromSQLValue(v)
 	}
-	return e.writeTo(e.store(t.engine), func(tx storeTx) error {
-		return tx.rowDelete(t.name, []byte(encodeKey(key)))
+	pkKey := encodeKey(key)
+	st := e.store(t.engine)
+	return e.writeTo(st, func(tx storeTx) error {
+		if len(t.indexes) > 0 {
+			old, err := tx.rowGet(t.name, []byte(pkKey))
+			if err != nil {
+				return err
+			}
+			if len(old) > 0 {
+				ov, err := decodeRow(old, t)
+				if err != nil {
+					return err
+				}
+				removeRowIndexes(t, ov, pkKey)
+			}
+		}
+		return tx.rowDelete(t.name, []byte(pkKey))
 	})
 }
 
@@ -226,7 +310,33 @@ func (e *Engine) DeleteRange(table string, r *sqlx.PKRange) (int64, error) {
 			if !ok {
 				return errors.New("range delete requires the CSTORE store")
 			}
-			return ct.rowDeleteRange(t.name, plLower, plUpper, &affected)
+			var pks [][]byte
+			if err := ct.colRowKeysRange(t.name, plLower, plUpper, func(pk []byte) error {
+				pks = append(pks, append([]byte(nil), pk...))
+				return nil
+			}); err != nil {
+				return err
+			}
+			for _, pk := range pks {
+				if len(t.indexes) > 0 {
+					old, err := tx.rowGet(t.name, pk)
+					if err != nil {
+						return err
+					}
+					if len(old) > 0 {
+						ov, err := decodeRow(old, t)
+						if err != nil {
+							return err
+						}
+						removeRowIndexes(t, ov, string(pk))
+					}
+				}
+				if err := ct.rowDelete(t.name, pk); err != nil {
+					return err
+				}
+			}
+			affected = int64(len(pks))
+			return nil
 		})
 	}()
 	if err != nil {
@@ -418,7 +528,7 @@ func toSQLValue(v sqlValue) sqlx.Value {
 		if v.null {
 			return sqlx.NullValue
 		}
-		return sqlx.TimestampValue(time.Unix(0, v.i))
+		return sqlx.TimestampValue(time.UnixMicro(v.i))
 	}
 	return sqlx.NullValue
 }
@@ -449,7 +559,9 @@ func fromSQLValue(v sqlx.Value) sqlValue {
 		if v.Null {
 			return sqlValue{typ: tTimestamp, null: true}
 		}
-		return sqlValue{typ: tTimestamp, i: v.Tm.UnixNano()}
+		// Microseconds since epoch: int64 µs covers ~±292k years, so far-future
+		// timestamps (e.g. year 9999 bound) don't overflow UnixNano's int64 ns.
+		return sqlValue{typ: tTimestamp, i: v.Tm.UnixMicro()}
 	}
 	return sqlValue{typ: tString, null: true}
 }

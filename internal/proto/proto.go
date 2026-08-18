@@ -39,6 +39,50 @@ type Response struct {
 	Result *ResultPayload
 }
 
+// --- cluster view types for the embedded UI ---
+
+// ColumnInfo is one column of a table.
+type ColumnInfo struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Primary bool   `json:"primary"`
+}
+
+// TableInfo is a catalog table summary.
+type TableInfo struct {
+	Name      string       `json:"name"`
+	Engine    string       `json:"engine"`
+	Shards    int          `json:"shards"`
+	Size      uint64       `json:"size"`
+	Retention string       `json:"retention,omitempty"`
+	Columns   []ColumnInfo `json:"columns"`
+}
+
+// ShardInfo is one shard of a table.
+type ShardInfo struct {
+	ID    string   `json:"id"`
+	Start string   `json:"start"`
+	End   string   `json:"end"`
+	Nodes []string `json:"nodes"`
+	Size  uint64   `json:"size"`
+}
+
+// NodeInfo is a registered cluster node.
+type NodeInfo struct {
+	ID       string `json:"id"`
+	SQLAddr  string `json:"sql_addr"`
+	RaftAddr string `json:"raft_addr"`
+}
+
+// NodeMetrics is per-node latency/throughput stats (JSON string from ADMIN
+// METRICS-JSON, kept opaque for the frontend).
+type NodeMetrics struct {
+	Node   string `json:"node"`
+	Addr   string `json:"addr"`
+	Status string `json:"status"` // up | down
+	JSON   string `json:"json,omitempty"`
+}
+
 // Addr is the address a Server listens on.
 type Addr interface{ String() string }
 

@@ -1,0 +1,85 @@
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--g-color-base-background);
+}
+
+/* logo: lightning-bolt badge (Yet Another DB, fast) + wordmark */
+.ydbgo-logo {
+  align-items: center;
+  display: flex;
+  gap: 13px;
+  padding-left: 13px;
+  color: var(--g-color-text-primary);
+  font-weight: 700;
+  font-size: 16px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.ydbgo-logo__badge {
+  align-items: center;
+  background: linear-gradient(135deg, #ffd666 0%, #ff9d2e 100%);
+  border-radius: 9px;
+  color: #fff;
+  display: flex;
+  flex-shrink: 0;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
+}
+
+.ydbgo-logo__text {
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+
+.ydbgo-logo--compact {
+  justify-content: center;
+  padding-left: 0;
+  width: 100%;
+}
+
+/* collapse button: Jira-like circular chevron under the logo */
+.ydbgo-collapse-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 10px;
+}
+
+.ydbgo-collapse {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+  color: var(--g-color-text-secondary);
+  cursor: pointer;
+  display: flex;
+  height: 28px;
+  justify-content: center;
+  transition: background 0.15s ease, color 0.15s ease;
+  width: 28px;
+}
+
+.ydbgo-collapse:hover {
+  background: var(--g-color-base-simple-hover);
+  color: var(--g-color-text-primary);
+}
+
+.ydbgo-collapse:focus-visible {
+  outline: 2px solid var(--g-color-line-focus);
+  outline-offset: 1px;
+}
+
+.ydbgo-collapse svg {
+  transition: transform 0.2s ease;
+}
+
+.ydbgo-collapse--closed svg {
+  transform: rotate(180deg);
+}

@@ -14,18 +14,32 @@ import (
 	"ydbgo/internal/storage"
 )
 
-// handleSplit triggers a manual split: ADMIN SPLIT TABLE <table> AT <pk-value>
+// handleSplit triggers a manual split: ADMIN SPLIT TABLE <table> AT <pk-values>
+// where <pk-values> is a single value ("AT 42") or a parenthesized list for a
+// composite primary key ("AT (42, 'foo')").
 func (m *Manager) handleSplit(req *proto.Request) *proto.Response {
 	if !m.meta.IsLeader() {
 		return m.forwardToLeaderSQL(req, req.SQL)
 	}
 	fields := strings.Fields(req.SQL)
-	if len(fields) != 6 || strings.ToUpper(fields[2]) != "TABLE" || strings.ToUpper(fields[4]) != "AT" {
-		return fail(req, errors.New("usage: ADMIN SPLIT TABLE <table> AT <pk-value>"))
+	if len(fields) < 6 || strings.ToUpper(fields[2]) != "TABLE" {
+		return fail(req, errors.New("usage: ADMIN SPLIT TABLE <table> AT <pk-values>"))
+	}
+	atIdx := -1
+	for i := 3; i < len(fields); i++ {
+		if strings.EqualFold(fields[i], "AT") {
+			atIdx = i
+			break
+		}
+	}
+	if atIdx < 0 {
+		return fail(req, errors.New("usage: ADMIN SPLIT TABLE <table> AT <pk-values>"))
 	}
 	table := fields[3]
-	pkVal := fields[5]
-	if err := m.splitShardByValue(table, pkVal); err != nil {
+	// Rejoin the tokens after AT: this reconstructs "(1, 'foo bar', 42)" that
+	// strings.Fields split on whitespace.
+	raw := strings.TrimSpace(strings.Join(fields[atIdx+1:], " "))
+	if err := m.splitShardByValue(table, raw); err != nil {
 		return fail(req, err)
 	}
 	return &proto.Response{ID: req.ID, OK: true, Result: &proto.ResultPayload{Type: "admin"}}
@@ -93,26 +107,35 @@ func hasNarrowerSucc(shards []*ShardSpec, spec *ShardSpec) bool {
 }
 
 // splitShardByValue adds a new empty shard split off spec at the given PK.
-func (m *Manager) splitShardByValue(table, pkVal string) error {
+// The split key is a single value ("42") or a parenthesized, comma-separated
+// list ("(42, 'foo')") matching the table's primary-key columns in schema order.
+func (m *Manager) splitShardByValue(table, raw string) error {
 	ts := m.table(table)
 	if ts == nil {
 		return notFound(table)
 	}
-	if len(ts.Schema.PK) != 1 {
-		return errors.New("split by value requires a single-column primary key")
-	}
-	col := ts.Schema.PK[0]
-	v, err := parseValueString(colTypeOf(ts.Schema, col), pkVal)
+	parts, err := parsePKSplitSpec(raw)
 	if err != nil {
 		return err
 	}
-	key := storage.EncodePK([]sqlx.Value{v})
+	if len(parts) != len(ts.Schema.PK) {
+		return fmt.Errorf("split key has %d value(s), but %q has a composite primary key of %d column(s)", len(parts), table, len(ts.Schema.PK))
+	}
+	values := make([]sqlx.Value, len(parts))
+	for i, col := range ts.Schema.PK {
+		v, err := parseValueString(colTypeOf(ts.Schema, col), unquote(parts[i]))
+		if err != nil {
+			return err
+		}
+		values[i] = v
+	}
+	key := storage.EncodePK(values)
 	spec := m.owningShard(table, key)
 	if spec == nil {
 		return notFound(table)
 	}
 	if len(spec.Start) > 0 && bytes.Compare([]byte(key), spec.Start) <= 0 {
-		return fmt.Errorf("split key %q is below shard %s start", pkVal, spec.ID)
+		return fmt.Errorf("split key %q is below shard %s start", raw, spec.ID)
 	}
 	return m.splitShard(spec, key)
 }
@@ -250,6 +273,64 @@ func literalFor(v sqlx.Value) string {
 	return "NULL"
 }
 
+// parsePKSplitSpec splits a split-key spec into raw values: a single bare
+// value ("42") or a parenthesized, comma-separated list ("(42, 'foo', ts)").
+func parsePKSplitSpec(s string) ([]string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, errors.New("empty split key")
+	}
+	if s[0] != '(' {
+		return []string{s}, nil
+	}
+	if s[len(s)-1] != ')' {
+		return nil, errors.New("unbalanced '(' in split key")
+	}
+	parts, err := splitCommaQuoted(s[1 : len(s)-1])
+	if err != nil {
+		return nil, err
+	}
+	return parts, nil
+}
+
+// splitCommaQuoted splits on commas while keeping single-quoted sections
+// (including escaped '' and quoted commas) intact.
+func splitCommaQuoted(s string) ([]string, error) {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '\'':
+			if inQuote && i+1 < len(s) && s[i+1] == '\'' {
+				cur.WriteByte('\'')
+				i++
+				continue
+			}
+			inQuote = !inQuote
+			cur.WriteByte(c)
+		case c == ',' && !inQuote:
+			out = append(out, strings.TrimSpace(cur.String()))
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if inQuote {
+		return nil, errors.New("unbalanced quote in split key")
+	}
+	out = append(out, strings.TrimSpace(cur.String()))
+	return out, nil
+}
+
+// unquote strips surrounding single quotes from a raw split-key value.
+func unquote(s string) string {
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
 func parseValueString(t sqlx.Type, s string) (sqlx.Value, error) {
 	switch t {
 	case sqlx.TypeInt:
@@ -266,6 +347,12 @@ func parseValueString(t sqlx.Type, s string) (sqlx.Value, error) {
 		return sqlx.FloatValue(v), nil
 	case sqlx.TypeBool:
 		return sqlx.BoolValue(s == "true" || s == "1"), nil
+	case sqlx.TypeTimestamp:
+		tm, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return sqlx.NullValue, fmt.Errorf("invalid timestamp pk value %q", s)
+		}
+		return sqlx.TimestampValue(tm), nil
 	default:
 		return sqlx.StrValue(s), nil
 	}

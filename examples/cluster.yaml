@@ -1,0 +1,14 @@
+# ydbgo cluster configuration (YDB-style: one file for every node).
+# Start a node with:
+#   ydbgo serve -config examples/cluster.yaml -node-id n1
+#   ydbgo serve -config examples/cluster.yaml -node-id n2
+# The node derives its listen addrs, data dir and join target from this file;
+# explicit flags still win (e.g. -http :8080). run/repl/bench accept -config too
+# and default to the bootstrap node's address.
+config:
+  hosts:
+  # bootstrap node: creates the meta group, everyone else joins it
+  - {host: 127.0.0.1, grpc: 2135, raft: 7001, data: ./ydbgo-data, id: n1, bootstrap: true}
+  # second node: join target = bootstrap host grpc addr, taken from the file
+  - {host: 127.0.0.1, grpc: 2136, raft: 7002, data: ./ydbgo-n2, id: n2}
+  - {host: 127.0.0.1, grpc: 2137, raft: 7003, data: ./ydbgo-n3, id: n3}

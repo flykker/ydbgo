@@ -35,84 +35,84 @@ func selWhere(t *testing.T, sql string) Expr {
 
 func TestPKRangeFromWhere(t *testing.T) {
 	tests := []struct {
-		name    string
-		pk      []string
-		where   string
-		wantRng bool
+		name      string
+		pk        []string
+		where     string
+		wantRng   bool
 		wantExact bool
-		wantLo  *PKBound // expected lower bound (or nil)
-		wantUp  *PKBound // expected upper bound (or nil)
+		wantLo    *PKBound // expected lower bound (or nil)
+		wantUp    *PKBound // expected upper bound (or nil)
 	}{
 		{
 			name: "ts lower bound", pk: []string{"ts"},
-			where: "WHERE ts >= '2024-01-01T00:00:00Z'",
+			where:   "WHERE ts >= '2024-01-01T00:00:00Z'",
 			wantRng: true, wantExact: true,
 			wantLo: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z")}, Incl: true},
 		},
 		{
 			name: "ts window", pk: []string{"ts"},
-			where: "WHERE ts >= '2024-01-01T00:00:00Z' AND ts < '2024-02-01T00:00:00Z'",
+			where:   "WHERE ts >= '2024-01-01T00:00:00Z' AND ts < '2024-02-01T00:00:00Z'",
 			wantRng: true, wantExact: true,
 			wantLo: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z")}, Incl: true},
 			wantUp: &PKBound{Prefix: []Value{mustTs("2024-02-01T00:00:00Z")}, Incl: false},
 		},
 		{
 			name: "point on full pk", pk: []string{"ts", "id"},
-			where: "WHERE ts = '2024-01-01T00:00:00Z' AND id = 42",
+			where:   "WHERE ts = '2024-01-01T00:00:00Z' AND id = 42",
 			wantRng: true, wantExact: true,
 			wantLo: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z"), IntValue(42)}, Incl: true},
 			wantUp: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z"), IntValue(42)}, Incl: true},
 		},
 		{
 			name: "prefix equality", pk: []string{"ts", "id"},
-			where: "WHERE ts = '2024-01-01T00:00:00Z'",
+			where:   "WHERE ts = '2024-01-01T00:00:00Z'",
 			wantRng: true, wantExact: true,
 			wantLo: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z")}, Incl: true},
 			wantUp: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z")}, Incl: true},
 		},
 		{
 			name: "eq then range", pk: []string{"ts", "id"},
-			where: "WHERE ts = '2024-01-01T00:00:00Z' AND id >= 5",
+			where:   "WHERE ts = '2024-01-01T00:00:00Z' AND id >= 5",
 			wantRng: true, wantExact: true,
 			wantLo: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z"), IntValue(5)}, Incl: true},
 		},
 		{
 			name: "non-pk only", pk: []string{"ts"},
-			where: "WHERE level = 'ERROR'",
+			where:   "WHERE level = 'ERROR'",
 			wantRng: false, wantExact: false,
 		},
 		{
 			name: "mixed pk and non-pk", pk: []string{"ts"},
-			where: "WHERE ts >= '2024-01-01T00:00:00Z' AND level = 'ERROR'",
+			where:   "WHERE ts >= '2024-01-01T00:00:00Z' AND level = 'ERROR'",
 			wantRng: true, wantExact: false,
 			wantLo: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z")}, Incl: true},
 		},
 		{
 			name: "or prevents prune", pk: []string{"ts"},
-			where: "WHERE ts >= '2024-01-01T00:00:00Z' OR level = 'ERROR'",
+			where:   "WHERE ts >= '2024-01-01T00:00:00Z' OR level = 'ERROR'",
 			wantRng: false, wantExact: false,
 		},
 		{
 			name: "eq with conflicting range not exact", pk: []string{"ts"},
-			where: "WHERE ts = '2024-01-01T00:00:00Z' AND ts >= '2024-02-01T00:00:00Z'",
+			where:   "WHERE ts = '2024-01-01T00:00:00Z' AND ts >= '2024-02-01T00:00:00Z'",
 			wantRng: true, wantExact: false,
 			wantLo: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z")}, Incl: true},
 			wantUp: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z")}, Incl: true},
 		},
 		{
 			name: "non-leading pk constrained", pk: []string{"ts", "id"},
-			where: "WHERE id = 42",
+			where:   "WHERE id = 42",
 			wantRng: false, wantExact: false,
 		},
 		{
 			name: "reversed comparison", pk: []string{"ts"},
-			where: "WHERE '2024-01-01T00:00:00Z' <= ts",
+			where:   "WHERE '2024-01-01T00:00:00Z' <= ts",
 			wantRng: true, wantExact: true,
 			wantLo: &PKBound{Prefix: []Value{mustTs("2024-01-01T00:00:00Z")}, Incl: true},
 		},
 		{
 			name: "string pk bound", pk: []string{"id"},
-			where: "WHERE id > 100",
+			where:   "WHERE id > 100",
 			wantRng: true, wantExact: true,
 			wantLo: &PKBound{Prefix: []Value{IntValue(100)}, Incl: false},
 		},
@@ -154,4 +154,82 @@ func pkboundsEqual(a, b *PKBound) bool {
 		}
 	}
 	return true
+}
+
+func TestPlanWhere(t *testing.T) {
+	tests := []struct {
+		name      string
+		where     string
+		wantExact bool
+		wantPred  *ColumnFilter // expected predicate (or nil)
+	}{
+		{
+			name: "like prefix folds to predicate", where: "WHERE level LIKE 'ERRO%'",
+			wantExact: true, wantPred: &ColumnFilter{Col: 2, Op: "LIKE", Lit: StrValue("ERRO")},
+		},
+		{
+			name: "equality-only like folds to equality", where: "WHERE level LIKE 'INFO'",
+			wantExact: true, wantPred: &ColumnFilter{Col: 2, Op: "=", Lit: StrValue("INFO")},
+		},
+		{
+			name: "non-pk equality folds", where: "WHERE level = 'ERROR'",
+			wantExact: true, wantPred: &ColumnFilter{Col: 2, Op: "=", Lit: StrValue("ERROR")},
+		},
+		{
+			name: "leading wildcard cannot fold", where: "WHERE level LIKE '%RROR'",
+			wantExact: false, wantPred: nil,
+		},
+		{
+			name: "mid wildcard cannot fold", where: "WHERE level LIKE 'E%OR'",
+			wantExact: false, wantPred: nil,
+		},
+		{
+			name: "leading underscore cannot fold", where: "WHERE level LIKE '_RROR'",
+			wantExact: false, wantPred: nil,
+		},
+		{
+			name: "pk window plus like predicate", where: "WHERE ts >= '2024-01-01T00:00:00Z' AND level LIKE 'ERRO%'",
+			wantExact: true, wantPred: &ColumnFilter{Col: 2, Op: "LIKE", Lit: StrValue("ERRO")},
+		},
+		{
+			name: "two non-pk predicates reject", where: "WHERE level = 'ERROR' AND score > 5",
+			wantExact: false, wantPred: nil,
+		},
+		{
+			name: "or rejects", where: "WHERE level = 'ERROR' OR level = 'INFO'",
+			wantExact: false, wantPred: nil,
+		},
+		{
+			name: "pk only gives no predicate", where: "WHERE ts >= '2024-01-01T00:00:00Z'",
+			wantExact: true, wantPred: nil,
+		},
+		{
+			name: "int equality predicate with type conversion", where: "WHERE score = 42",
+			wantExact: true, wantPred: &ColumnFilter{Col: 3, Op: "=", Lit: IntValue(42)},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			where := selWhere(t, "SELECT * FROM logs "+tc.where)
+			_, pred, exact := PlanWhere(pruneSchema("ts", "id"), where)
+			if exact != tc.wantExact {
+				t.Fatalf("exact=%v, want %v", exact, tc.wantExact)
+			}
+			if tc.wantPred == nil {
+				if pred != nil {
+					t.Fatalf("pred=%+v, want nil", pred)
+				}
+				return
+			}
+			if pred == nil {
+				t.Fatal("pred=nil, want non-nil")
+			}
+			if pred.Col != tc.wantPred.Col || pred.Op != tc.wantPred.Op {
+				t.Fatalf("pred=%+v, want %+v", pred, tc.wantPred)
+			}
+			if c, err := Compare(pred.Lit, tc.wantPred.Lit); err != nil || c != 0 {
+				t.Fatalf("pred.Lit=%v, want %v (err=%v)", pred.Lit, tc.wantPred.Lit, err)
+			}
+		})
+	}
 }

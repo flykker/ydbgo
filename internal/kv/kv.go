@@ -63,6 +63,15 @@ type Store struct {
 	hub  *hub
 }
 
+// iterSource is implemented by both *pebble.DB and *pebble.Snapshot so range
+// scans can run against the live store or a pinned point-in-time view.
+type iterSource interface {
+	NewIter(*pebble.IterOptions) (*pebble.Iterator, error)
+}
+
+var _ iterSource = (*pebble.DB)(nil)
+var _ iterSource = (*pebble.Snapshot)(nil)
+
 // Open opens (or creates) a versioned byte-KV at dir.
 func Open(dir string) (*Store, error) {
 	opts := &pebble.Options{}
@@ -91,6 +100,114 @@ func (s *Store) Latest() Revision {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.last
+}
+
+// Snapshot is a point-in-time read view of the store. It stays consistent as
+// the store continues to accept applies, so snapshot serialization can run
+// concurrently with live writes (it is the raft FSM snapshot path).
+type Snapshot struct {
+	snap *pebble.Snapshot
+	rev  Revision // pinned effective revision
+}
+
+// Snapshot captures a point-in-time view pinned at the current committed
+// revision. Cheap (O(1)) and safe to call on a raft FSM goroutine.
+func (s *Store) Snapshot() *Snapshot {
+	s.mu.Lock()
+	snap := s.db.NewSnapshot()
+	rev := s.last
+	s.mu.Unlock()
+	return &Snapshot{snap: snap, rev: rev}
+}
+
+// Close releases the pinned view.
+func (sn *Snapshot) Close() { sn.snap.Close() }
+
+// Get reads the value of key as of the pinned revision.
+func (sn *Snapshot) Get(key []byte) ([]byte, bool, error) {
+	it, err := sn.snap.NewIter(&pebble.IterOptions{
+		LowerBound: dataKey(key, sn.rev),
+		UpperBound: dataUpper(key),
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	defer it.Close()
+	it.SeekGE(dataKey(key, sn.rev))
+	if !it.Valid() {
+		return nil, false, it.Error()
+	}
+	if !bytes.Equal(extractKey(it.Key()), key) {
+		return nil, false, nil
+	}
+	val := it.Value()
+	if len(val) == 0 || val[0] == flagTomb {
+		return nil, false, nil
+	}
+	return append([]byte(nil), val[1:]...), true, nil
+}
+
+// Range iterates keys in [start, end) as of the pinned revision, in byte
+// order. fn receives the key, its value and whether it is a tombstone. The
+// value is a fresh copy valid after fn returns.
+func (sn *Snapshot) Range(start, end []byte, fn func(key, val []byte, deleted bool) error) error {
+	return rangeIter(sn.snap, sn.rev, sn.rev, start, end, false, fn)
+}
+
+// RangeNoCopy is Range without the per-value copy: the value passed to fn
+// aliases the snapshot iterator buffer and is only valid during the call.
+func (sn *Snapshot) RangeNoCopy(start, end []byte, fn func(key, val []byte, deleted bool) error) error {
+	return rangeIter(sn.snap, sn.rev, sn.rev, start, end, true, fn)
+}
+
+// RangeCount counts the distinct logical keys in [start, end) as of the pinned
+// revision, without decoding values or invoking a per-key callback.
+func (sn *Snapshot) RangeCount(start, end []byte) (int64, error) {
+	return rangeCount(sn.snap, start, end)
+}
+
+// rangeCount counts distinct logical keys in [start, end) of a source whose
+// top-of-group version is the visible one (latest source, or a pinned
+// snapshot): each key's older versions are skipped with sequential Next()s,
+// and a key whose newest version is a tombstone is not counted.
+func rangeCount(src iterSource, start, end []byte) (int64, error) {
+	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
+		return 0, nil
+	}
+	lower := []byte{dataTag}
+	if start != nil {
+		lower = append(lower, start...)
+		lower = append(lower, 0)
+	}
+	var upper []byte
+	if end != nil {
+		upper = dataUpper(end)
+	}
+	it, err := src.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return 0, err
+	}
+	defer it.Close()
+	var n int64
+	var prev []byte
+	for it.SeekGE(lower); it.Valid(); {
+		raw := extractKey(it.Key())
+		if end != nil && bytes.Compare(raw, end) >= 0 {
+			break // same boundary filter as rangeIter: raw key >= end
+		}
+		// The group's top version (newest) sorts first; a key whose newest
+		// version is a tombstone is not live and is not counted.
+		val := it.Value()
+		if len(val) > 0 && val[0] != flagTomb {
+			n++
+		}
+		prev = append(prev[:0], raw...)
+		it.Next()
+		for it.Valid() && bytes.Equal(extractKey(it.Key()), prev) {
+			it.Next()
+		}
+	}
+	return n, it.Error()
 }
 
 // Op is a single mutation to apply at a revision.
@@ -146,6 +263,30 @@ func (s *Store) applyLocked(rev Revision, ops []Op) error {
 	s.last = rev
 	s.hub.notify(rev, ops)
 	return nil
+}
+
+// CompactLSM forces a full Pebble LSM compaction over the whole key space,
+// merging the freshly-written L0 SSTables into the lower levels. Reads after a
+// bulk load otherwise pay per-file seek overhead against the short, unmerged
+// table runs. Blocking and expensive: for administrative use only.
+func (s *Store) CompactLSM() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	it, err := s.db.NewIter(nil)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	if !it.First() {
+		return nil // empty store: nothing to compact
+	}
+	lower := append([]byte(nil), it.Key()...)
+	it.Last()
+	last := append([]byte(nil), it.Key()...)
+	// bump the max key with a trailing 0x00 so the range is exclusive and
+	// still covers every stored key (any prefix sorts before its extension).
+	upper := append(last, 0x00)
+	return s.db.Compact(lower, upper, true)
 }
 
 // Compact physically removes superseded versions, keeping the state as of
@@ -240,11 +381,56 @@ func (s *Store) Get(rev Revision, key []byte) ([]byte, bool, error) {
 // Range iterates keys in [start, end) at revision rev (0 = latest), in byte
 // order. fn receives the key, its value as of rev and whether it is a
 // tombstone (deleted) version. The newest version not newer than rev wins.
+// Range iterates keys in [start, end) at revision rev (0 = latest) in byte
+// order. fn receives the key, its value as of rev and whether it is a tombstone
+// (deleted) version. The newest version not newer than rev wins. The value
+// passed to fn is a fresh copy valid after fn returns; use RangeNoCopy when the
+// callback consumes the value inline.
 func (s *Store) Range(rev Revision, start, end []byte, fn func(key, val []byte, deleted bool) error) error {
+	return s.rangeIt(rev, start, end, false, fn)
+}
+
+// RangeNoCopy is Range without the per-value copy: the value slice passed to fn
+// is only valid during the call (it aliases the pebble iterator buffer), so fn
+// must not retain it.
+func (s *Store) RangeNoCopy(rev Revision, start, end []byte, fn func(key, val []byte, deleted bool) error) error {
+	return s.rangeIt(rev, start, end, true, fn)
+}
+
+// RangeCount counts the distinct logical keys in [start, end) without decoding
+// values or invoking a per-key callback. Cheaper than Range with a counting
+// closure; the semantic is identical to Range (each key counted once, its
+// latest-visible version considered live).
+func (s *Store) RangeCount(rev Revision, start, end []byte) (int64, error) {
+	R := s.effective(rev)
+	if R != s.last {
+		// A non-latest revision may hide the newest versions of some keys, so
+		// the raw version-skipping count is not safe; fall back to Range.
+		var n int64
+		if err := rangeIter(s.db, s.last, R, start, end, true, func(_, _ []byte, _ bool) error {
+			n++
+			return nil
+		}); err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+	return rangeCount(s.db, start, end)
+}
+
+func (s *Store) rangeIt(rev Revision, start, end []byte, noCopy bool, fn func(key, val []byte, deleted bool) error) error {
+	R := s.effective(rev)
+	return rangeIter(s.db, s.last, R, start, end, noCopy, fn)
+}
+
+// rangeIter walks [start, end) of an iterator source, selecting for each key
+// the newest version not newer than R. last is the revision used to take the
+// fast path (all versions in the source <= last, so the group's top version is
+// the answer). noCopy skips the per-value copy (callback must consume inline).
+func rangeIter(src iterSource, last Revision, R Revision, start, end []byte, noCopy bool, fn func(key, val []byte, deleted bool) error) error {
 	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
 		return nil // empty or inverted range: nothing to iterate
 	}
-	R := s.effective(rev)
 	lower := []byte{dataTag}
 	if start != nil {
 		// Seek to the group boundary (no revision suffix): the starting key may
@@ -258,17 +444,18 @@ func (s *Store) Range(rev Revision, start, end []byte, fn func(key, val []byte, 
 	if end != nil {
 		upper = dataUpper(end)
 	}
-	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	it, err := src.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return err
 	}
 	defer it.Close()
 	it.SeekGE(lower)
-	if R == s.last {
+	if R == last {
 		// Latest-revision scan: within each key's group the newest version
-		// sorts first and dataUpper(raw) jumps straight to the next key's
-		// newest version, so no per-key reposition is needed.
-		var upperBuf []byte
+		// sorts first. Each key is processed once, then older versions of the
+		// same key (if any) are skipped with sequential Next()s, which is
+		// cheaper than a per-key SeekGE tree search.
+		var prev []byte
 		for it.Valid() {
 			raw := extractKey(it.Key())
 			if end != nil && bytes.Compare(raw, end) >= 0 {
@@ -278,13 +465,22 @@ func (s *Store) Range(rev Revision, start, end []byte, fn func(key, val []byte, 
 			deleted := len(val) == 0 || val[0] == flagTomb
 			var payload []byte
 			if !deleted {
-				payload = append([]byte(nil), val[1:]...)
+				if noCopy {
+					payload = val[1:]
+				} else {
+					payload = append([]byte(nil), val[1:]...)
+				}
 			}
+			// Snapshot the key before advancing: it aliases the pebble
+			// iterator buffer which Next() may reuse.
+			prev = append(prev[:0], raw...)
 			if err := fn(raw, payload, deleted); err != nil {
 				return err
 			}
-			upperBuf = dataUpperInto(upperBuf[:0], raw)
-			it.SeekGE(upperBuf)
+			it.Next()
+			for it.Valid() && bytes.Equal(extractKey(it.Key()), prev) {
+				it.Next()
+			}
 		}
 		return it.Error()
 	}
@@ -305,7 +501,11 @@ func (s *Store) Range(rev Revision, start, end []byte, fn func(key, val []byte, 
 		deleted := len(val) == 0 || val[0] == flagTomb
 		var payload []byte
 		if !deleted {
-			payload = append([]byte(nil), val[1:]...)
+			if noCopy {
+				payload = val[1:]
+			} else {
+				payload = append([]byte(nil), val[1:]...)
+			}
 		}
 		if err := fn(raw, payload, deleted); err != nil {
 			return err
@@ -355,7 +555,9 @@ func (s *Store) RangeDesc(rev Revision, start, end []byte, fn func(key, val []by
 		it.Last()
 	}
 	for it.Valid() {
-		raw := extractKey(it.Key())
+		// copy: the iterator's key buffer is reused on every move, so a slice
+		// into it must not outlive the current position.
+		raw := append([]byte(nil), extractKey(it.Key())...)
 		if start != nil && bytes.Compare(raw, start) < 0 {
 			break
 		}

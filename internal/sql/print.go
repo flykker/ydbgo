@@ -18,9 +18,17 @@ func StatementString(st Statement) string {
 		}
 		return s + n.Name
 	case *CreateIndexStmt:
-		return fmt.Sprintf("create index %s on %s (%s)", n.Name, n.Table, strings.Join(n.Columns, ", "))
+		s := "create index "
+		if n.IfNotExists {
+			s += "if not exists "
+		}
+		return fmt.Sprintf("%s%s on %s (%s)", s, n.Name, n.Table, strings.Join(n.Columns, ", "))
 	case *DropIndexStmt:
-		return fmt.Sprintf("drop index %s", n.Name)
+		s := "drop index "
+		if n.IfExists {
+			s += "if exists "
+		}
+		return s + n.Name
 	case *InsertStmt:
 		var sb strings.Builder
 		sb.WriteString("insert into ")

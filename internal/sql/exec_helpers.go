@@ -60,7 +60,7 @@ func isAggregate(e Expr) bool {
 	switch n := e.(type) {
 	case *Call:
 		switch strings.ToLower(n.Name) {
-		case "count", "sum", "min", "max", "avg":
+		case "count", "sum", "min", "max", "avg", "count_if":
 			return true
 		}
 	case *BinaryOp:
@@ -269,6 +269,22 @@ func evalAggregateCall(n *Call, rows []map[string]Value) (Value, error) {
 			return NullValue, nil
 		}
 		return FloatValue(total / float64(cnt)), nil
+	case "count_if":
+		if len(n.Args) != 1 {
+			return NullValue, fmt.Errorf("count_if requires 1 argument")
+		}
+		cnt := int64(0)
+		for _, ctx := range rows {
+			v, err := Eval(n.Args[0], ctx)
+			if err != nil {
+				return NullValue, err
+			}
+			b, ok := boolOf(v)
+			if ok && b {
+				cnt++
+			}
+		}
+		return IntValue(cnt), nil
 	}
 	return evalCall(n, rows[0])
 }

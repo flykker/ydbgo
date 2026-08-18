@@ -1,5 +1,6 @@
 # binaries
 /ydbgo
+/bin/
 /dist/
 
 # data directories (standalone + per-node n1..nN)

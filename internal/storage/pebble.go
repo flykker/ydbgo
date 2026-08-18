@@ -93,6 +93,23 @@ func (s *pebbleStore) Close() error {
 	return err
 }
 
+// CompactLSM forces a full Pebble LSM compaction over the whole key space.
+func (s *pebbleStore) CompactLSM() error {
+	it, err := s.db.NewIter(nil)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	if !it.First() {
+		return nil // empty store: nothing to compact
+	}
+	lower := append([]byte(nil), it.Key()...)
+	it.Last()
+	last := append([]byte(nil), it.Key()...)
+	upper := append(last, 0x00)
+	return s.db.Compact(lower, upper, true)
+}
+
 func (s *pebbleStore) begin() (storeTx, error) {
 	return &pebbleTx{b: s.db.NewIndexedBatch()}, nil
 }
@@ -101,6 +118,10 @@ func (s *pebbleStore) view(fn func(tx storeTx) error) error {
 	snap := s.db.NewSnapshot()
 	defer snap.Close()
 	return fn(&pebbleTx{r: snap})
+}
+
+func (s *pebbleStore) snapshot() (storeTx, error) {
+	return &pebbleTx{r: s.db.NewSnapshot()}, nil
 }
 
 // pebbleTx wraps either a writable Batch (from begin) or a read-only Snapshot

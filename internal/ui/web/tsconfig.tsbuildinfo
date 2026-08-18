@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/api.ts","./src/export.ts","./src/hash.ts","./src/main.tsx","./src/components/ResultTable.tsx","./src/components/WidgetRenderer.tsx","./src/pages/Cluster.tsx","./src/pages/Dashboards.tsx","./src/pages/Logs.tsx","./src/pages/MetricsCharts.tsx","./src/pages/Sql.tsx"],"version":"5.9.3"}

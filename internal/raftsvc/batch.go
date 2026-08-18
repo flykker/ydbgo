@@ -2,6 +2,9 @@ package raftsvc
 
 import (
 	"errors"
+	"log"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -10,13 +13,34 @@ import (
 	sqlx "ydbgo/internal/sql"
 )
 
-// Batch config bounds for group-committed raft entries.
+// Batch config bounds for group-committed raft entries. The defaults can be
+// overridden with YDBGO_BATCH_WINDOW_MS / YDBGO_BATCH_MAXOPS /
+// YDBGO_BATCH_HARD_WINDOW_MS.
 const (
-	batchWindowMs = 1    // max time to fill a batch before flushing
-	batchMaxOps   = 4096 // max statements folded into one raft entry
-	batchBuf      = 512  // buffered enqueue ahead of the flush loop
-	applyTimeout  = 10 * time.Second
+	batchWindowMs   = 1    // quiet-gap: max idle time before flushing a batch
+	batchMaxOps     = 4096 // max statements folded into one raft entry
+	batchHardWindow = 4    // latency bound (ms) under sustained load
+	batchBuf        = 512  // buffered enqueue ahead of the flush loop
+	applyTimeout    = 10 * time.Second
 )
+
+func envMs(name string, def int) time.Duration {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return time.Duration(def) * time.Millisecond
+}
+
+func envInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 // batchItem is one caller's write statement waiting for commit.
 type batchItem struct {
@@ -37,7 +61,8 @@ type batchItem struct {
 type batcher struct {
 	getRaft func() *raft.Raft
 
-	window time.Duration
+	window time.Duration // quiet-gap between arrivals before flushing
+	hard   time.Duration // latency bound for a batch under sustained load
 	maxOps int
 
 	ch       chan *batchItem
@@ -48,8 +73,9 @@ type batcher struct {
 func newBatcher(get func() *raft.Raft) *batcher {
 	return &batcher{
 		getRaft: get,
-		window:  batchWindowMs * time.Millisecond,
-		maxOps:  batchMaxOps,
+		window:  envMs("YDBGO_BATCH_WINDOW_MS", batchWindowMs),
+		hard:    envMs("YDBGO_BATCH_HARD_WINDOW_MS", batchHardWindow),
+		maxOps:  envInt("YDBGO_BATCH_MAXOPS", batchMaxOps),
 		ch:      make(chan *batchItem, batchBuf),
 		close:   make(chan struct{}),
 	}
@@ -84,16 +110,30 @@ func (b *batcher) loop() {
 		case <-b.close:
 			return
 		case first := <-b.ch:
+			// Nothing else is queued: apply right away instead of paying the
+			// batch window for a single statement (idle writes get no
+			// artificial latency; busy periods still coalesce in flush).
+			if len(b.ch) == 0 {
+				b.apply([]*batchItem{first})
+				continue
+			}
 			b.flush(first)
 		}
 	}
 }
 
-// flush gathers up to maxOps statements arriving within the window around the
-// first pending op and submits them as a single raft entry.
+// flush gathers up to maxOps statements and submits them as a single raft
+// entry. Collection uses an adaptive quiet-gap window: it keeps draining the
+// queue while statements keep arriving within `window` of the last one, so
+// concurrent back-to-back writes pack into one batch (fewer raft entries,
+// fewer fsyncs), and flushes once a quiet gap of `window` passes, the batch
+// fills, or the hard latency bound is hit.
 func (b *batcher) flush(first *batchItem) {
 	pending := []*batchItem{first}
-	window := time.NewTimer(b.window)
+	quiet := time.NewTimer(b.window)
+	defer quiet.Stop()
+	hard := time.NewTimer(b.hard)
+	defer hard.Stop()
 collect:
 	for {
 		select {
@@ -102,7 +142,17 @@ collect:
 			if len(pending) >= b.maxOps {
 				break collect
 			}
-		case <-window.C:
+			// Reset the quiet gap: arrivals keep the batch open.
+			if !quiet.Stop() {
+				select {
+				case <-quiet.C:
+				default:
+				}
+			}
+			quiet.Reset(b.window)
+		case <-quiet.C:
+			break collect
+		case <-hard.C:
 			break collect
 		}
 	}
@@ -110,7 +160,10 @@ collect:
 }
 
 // apply submits all pending statements as one raft.Apply and fans out the
-// result to the waiting callers.
+// result to the waiting callers. The commit is awaited in a goroutine so the
+// flush loop can pipeline the next batch: raft preserves log order and each
+// caller still blocks on its own commit, but the quorum/fsync latency of
+// consecutive entries overlaps instead of serializing.
 func (b *batcher) apply(pending []*batchItem) {
 	r := b.getRaft()
 	if r == nil {
@@ -123,7 +176,36 @@ func (b *batcher) apply(pending []*batchItem) {
 	}
 	payload := sqlx.EncodeStatements(stmts)
 	f := r.Apply(payload, applyTimeout)
-	err := f.Error()
+	go func() {
+		// Watchdog: if the raft entry never commits (leader can't reach
+		// quorum), surface the raft state once instead of hanging silently.
+		type result struct {
+			err  error
+			done bool
+		}
+		ch := make(chan result, 1)
+		go func() {
+			err := f.Error()
+			ch <- result{err: err, done: true}
+		}()
+		select {
+		case res := <-ch:
+			b.completeApply(pending, f, res.err)
+		case <-time.After(applyTimeout):
+			log.Printf("BATCH-STALL: raft entry %s (%d ops) not committed within %s; stats: %v",
+				r.String(), len(pending), applyTimeout, r.Stats())
+			select {
+			case res := <-ch:
+				b.completeApply(pending, f, res.err)
+			case <-time.After(60 * time.Second):
+				log.Printf("BATCH-STALL-DEAD: still waiting after 60s for raft entry %s", r.String())
+				b.completeApply(pending, f, errors.New("raft apply stalled"))
+			}
+		}
+	}()
+}
+
+func (b *batcher) completeApply(pending []*batchItem, f raft.ApplyFuture, err error) {
 	var results []*sqlx.Result
 	if err == nil {
 		if resp, ok := f.Response().([]*sqlx.Result); ok {

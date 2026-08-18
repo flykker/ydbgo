@@ -109,12 +109,21 @@ func openKV(dir string) (*kvStore, error) {
 
 func (s *kvStore) Close() error { return s.st.Close() }
 
+// CompactLSM forces a full LSM compaction over the store's key space.
+func (s *kvStore) CompactLSM() error { return s.st.CompactLSM() }
+
 func (s *kvStore) begin() (storeTx, error) {
 	return &kvTx{s: s, overlay: map[string]*pending{}}, nil
 }
 
 func (s *kvStore) view(fn func(tx storeTx) error) error {
 	return fn(&kvTx{s: s})
+}
+
+// snapshot captures a point-in-time view pinned at the current committed
+// revision; release it with rollback.
+func (s *kvStore) snapshot() (storeTx, error) {
+	return &kvTx{s: s, snap: s.st.Snapshot()}, nil
 }
 
 // pending is an uncommitted write in the overlay (read-your-writes view).
@@ -124,12 +133,14 @@ type pending struct {
 }
 
 // kvTx buffers writes in memory and flushes them as one kv.Apply on commit,
-// giving the storage engine an MVCC-capable writable/revisioned tx.
+// giving the storage engine an MVCC-capable writable/revisioned tx. When snap
+// is set the tx is a read-only point-in-time view (raft FSM snapshot path).
 type kvTx struct {
 	s       *kvStore
 	overlay map[string]*pending // key -> latest pending write ('' = delete)
 	ops     []kv.Op
 	active  bool // writable (from begin); otherwise read-only view
+	snap    *kv.Snapshot
 }
 
 func (t *kvTx) pkey(key []byte) string { return string(key) }
@@ -154,6 +165,16 @@ func (t *kvTx) get(key []byte) ([]byte, error) {
 		}
 		return p.value, nil
 	}
+	if t.snap != nil {
+		v, ok, err := t.snap.Get(key)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
+		return v, nil
+	}
 	v, ok, err := t.s.st.Get(0, key)
 	if err != nil {
 		return nil, err
@@ -168,13 +189,28 @@ func (t *kvTx) get(key []byte) ([]byte, error) {
 func (t *kvTx) each(lower, upper []byte, fn func(k, v []byte) error) error {
 	ordered := []string{}
 	vals := map[string][]byte{}
-	t.s.st.Range(0, lower, upper, func(key, val []byte, deleted bool) error {
-		if !deleted {
-			ordered = append(ordered, t.pkey(key))
-			vals[t.pkey(key)] = append([]byte(nil), val...)
+	if t.snap != nil {
+		if err := t.snap.Range(lower, upper, func(key, val []byte, deleted bool) error {
+			if !deleted {
+				ordered = append(ordered, t.pkey(key))
+				vals[t.pkey(key)] = append([]byte(nil), val...)
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
-		return nil
-	})
+	} else {
+		err := t.s.st.Range(0, lower, upper, func(key, val []byte, deleted bool) error {
+			if !deleted {
+				ordered = append(ordered, t.pkey(key))
+				vals[t.pkey(key)] = append([]byte(nil), val...)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
 	// overlay may add or replace keys that fall in this range.
 	for _, op := range t.ops {
 		k := t.pkey(op.Key)
@@ -311,5 +347,9 @@ func (t *kvTx) commit() error {
 func (t *kvTx) rollback() error {
 	t.ops = nil
 	t.overlay = map[string]*pending{}
+	if t.snap != nil {
+		t.snap.Close()
+		t.snap = nil
+	}
 	return nil
 }

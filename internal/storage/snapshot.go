@@ -17,38 +17,82 @@ func frameRecord(payload []byte) []byte {
 
 const walHeader = 8
 
-// MarshalState serializes the entire engine state (all tables, schemas and
-// rows) as a framed stream of WAL records. The output is directly replayable
-// via applyFramed and is used as the raft FSM snapshot payload. Rows are read
-// from each table's own engine store.
-func (e *Engine) MarshalState() ([]byte, error) {
-	var out []byte
-	for _, name := range e.sortedTables() {
+// snapshotTable captures one table's schema and a pinned point-in-time read
+// transaction over its store.
+type snapshotTable struct {
+	t  *table
+	tx storeTx
+}
+
+// EngineSnap is a point-in-time view of the engine: cheap to capture on the
+// raft FSM goroutine, serialized later (possibly while the engine accepts
+// writes) by MarshalSnap.
+type EngineSnap struct {
+	tables []*snapshotTable
+}
+
+// Release frees the pinned store views.
+func (s *EngineSnap) Release() {
+	if s == nil {
+		return
+	}
+	for _, st := range s.tables {
+		if st.tx != nil {
+			st.tx.rollback()
+		}
+	}
+	s.tables = nil
+}
+
+// CaptureSnapshot captures a consistent point-in-time view of every table's
+// schema and data. It only pins store snapshots (O(stores), no row reads), so
+// it is safe to call on the raft FSM goroutine without stalling log applies.
+func (e *Engine) CaptureSnapshot() (*EngineSnap, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	names := e.SortedTables()
+	snap := &EngineSnap{tables: make([]*snapshotTable, 0, len(names))}
+	for _, name := range names {
 		t := e.tables[name]
+		tx, err := e.store(t.engine).snapshot()
+		if err != nil {
+			snap.Release()
+			return nil, err
+		}
+		snap.tables = append(snap.tables, &snapshotTable{t: t, tx: tx})
+	}
+	return snap, nil
+}
+
+// MarshalSnap serializes a captured snapshot as a framed stream of WAL records
+// (create-table + row/KV mutations), replayable via applyFramed. Each table's
+// data is read from its pinned point-in-time view, so it may run concurrently
+// with live writes.
+func (e *Engine) MarshalSnap(snap *EngineSnap) ([]byte, error) {
+	var out []byte
+	for _, st := range snap.tables {
+		t := st.t
+		name := t.name
 		out = append(out, frameRecord(e.encodeCreateTable(t))...)
-		err := e.readFrom(e.store(t.engine), func(tx storeTx) error {
-			return tx.rowEach(name, func(k, v []byte) error {
-				vals, err := decodeRow(v, t)
-				if err != nil {
-					return err
-				}
-				out = append(out, frameRecord(e.encodeMutate(name, mutatePut{key: string(k), values: vals}))...)
-				return nil
-			})
+		err := st.tx.rowEach(name, func(k, v []byte) error {
+			vals, err := decodeRow(v, t)
+			if err != nil {
+				return err
+			}
+			out = append(out, frameRecord(e.encodeMutate(name, mutatePut{key: string(k), values: vals}))...)
+			return nil
 		})
 		if err != nil {
 			return nil, err
 		}
 		if t.engine == "KV" {
-			err := e.readFrom(e.store(t.engine), func(tx storeTx) error {
-				kt, ok := tx.(*kvTx)
-				if !ok {
-					return nil
-				}
-				return kt.dataEach(name, "", "", func(k, v []byte) error {
-					out = append(out, frameRecord(e.encodeKVData(name, k, v))...)
-					return nil
-				})
+			kt, ok := st.tx.(*kvTx)
+			if !ok {
+				continue
+			}
+			err := kt.dataEach(name, "", "", func(k, v []byte) error {
+				out = append(out, frameRecord(e.encodeKVData(name, k, v))...)
+				return nil
 			})
 			if err != nil {
 				return nil, err
@@ -56,6 +100,19 @@ func (e *Engine) MarshalState() ([]byte, error) {
 		}
 	}
 	return out, nil
+}
+
+// MarshalState serializes the entire engine state (all tables, schemas and
+// rows) as a framed stream of WAL records. The output is directly replayable
+// via applyFramed and is used as the raft FSM snapshot payload. Rows are read
+// from each table's own engine store.
+func (e *Engine) MarshalState() ([]byte, error) {
+	snap, err := e.CaptureSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	defer snap.Release()
+	return e.MarshalSnap(snap)
 }
 
 // ReplaceState rebuilds the engine from a MarshalState payload, atomically
@@ -67,7 +124,7 @@ func (e *Engine) ReplaceState(data []byte) error {
 	txs := map[store]storeTx{}
 	e.active.Store(&txs)
 	defer func() { e.active.Store(nil) }()
-	for _, name := range e.sortedTables() {
+	for _, name := range e.SortedTables() {
 		t := e.tables[name]
 		if err := e.writeTo(e.store(""), func(tx storeTx) error {
 			return tx.schemaDelete(name)
@@ -83,6 +140,13 @@ func (e *Engine) ReplaceState(data []byte) error {
 	e.tables = map[string]*table{}
 	err := e.applyFramed(data)
 	if err != nil {
+		for _, tx := range txs {
+			tx.rollback()
+		}
+		return err
+	}
+	// Rebuild secondary index entries from the restored rows.
+	if err := e.rebuildIndexes(); err != nil {
 		for _, tx := range txs {
 			tx.rollback()
 		}

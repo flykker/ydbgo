@@ -197,8 +197,11 @@ func (p *Parser) parseCreate() (Statement, error) {
 	if p.acceptKeyword("database") {
 		return &CreateDatabaseStmt{Name: p.identLower()}, nil
 	}
+	if p.acceptKeyword("index") {
+		return p.parseCreateIndex()
+	}
 	if !p.acceptKeyword("table") {
-		return nil, fmt.Errorf("expected TABLE at pos %d", p.peek().pos)
+		return nil, fmt.Errorf("expected TABLE or INDEX at pos %d", p.peek().pos)
 	}
 	stmt := &CreateTableStmt{}
 	if p.isKeyword("if") {
@@ -215,6 +218,11 @@ func (p *Parser) parseCreate() (Statement, error) {
 	}
 	for {
 		if p.peek().kind == tokRParen {
+			break
+		}
+		// table-level composite primary key inside the column list:
+		// (..., PRIMARY KEY (col1, col2))
+		if p.isKeyword("primary") {
 			break
 		}
 		col := ColumnDef{}
@@ -236,6 +244,12 @@ func (p *Parser) parseCreate() (Statement, error) {
 		if p.isKeyword("primary") {
 			p.advance()
 			p.acceptKeyword("key")
+			if p.peek().kind == tokLParen {
+				// table-level composite PK — rewind "primary key" and let the
+				// table-level clause below consume them.
+				p.pos -= 2
+				break
+			}
 			col.AsPrimary = true
 			col.NotNull = true
 		}
@@ -255,10 +269,7 @@ func (p *Parser) parseCreate() (Statement, error) {
 		}
 		break
 	}
-	if _, err := p.expect(tokRParen, ")"); err != nil {
-		return nil, err
-	}
-	// optional table-level: PRIMARY KEY(...)
+	// optional table-level: PRIMARY KEY(...) — inside the column list parens
 	if p.isKeyword("primary") {
 		p.advance()
 		p.acceptKeyword("key")
@@ -279,6 +290,9 @@ func (p *Parser) parseCreate() (Statement, error) {
 		if _, err := p.expect(tokRParen, ")"); err != nil {
 			return nil, err
 		}
+	}
+	if _, err := p.expect(tokRParen, ")"); err != nil {
+		return nil, err
 	}
 	// optional: ENGINE=<TABLE|KV|CSTORE>
 	if p.acceptKeyword("engine") {
@@ -308,6 +322,47 @@ func (p *Parser) parseCreate() (Statement, error) {
 			return nil, fmt.Errorf("bad RETENTION at pos %d: %v", p.peek().pos, err)
 		}
 		stmt.Retention = d
+	}
+	return stmt, nil
+}
+
+// parseCreateIndex parses: CREATE INDEX [IF NOT EXISTS] name ON table (col [, ...]).
+func (p *Parser) parseCreateIndex() (Statement, error) {
+	stmt := &CreateIndexStmt{}
+	if p.isKeyword("if") {
+		p.advance()
+		p.acceptKeyword("not")
+		p.expect(tokIdent, "EXISTS")
+		stmt.IfNotExists = true
+	}
+	if p.peek().kind != tokIdent {
+		return nil, fmt.Errorf("expected index name at pos %d", p.peek().pos)
+	}
+	stmt.Name = p.identLower()
+	p.acceptKeyword("on")
+	if p.peek().kind != tokIdent {
+		return nil, fmt.Errorf("expected table name at pos %d", p.peek().pos)
+	}
+	stmt.Table = p.identLower()
+	if _, err := p.expect(tokLParen, "("); err != nil {
+		return nil, err
+	}
+	for {
+		if p.peek().kind == tokRParen {
+			break
+		}
+		if p.peek().kind != tokIdent {
+			return nil, fmt.Errorf("expected column name at pos %d", p.peek().pos)
+		}
+		stmt.Columns = append(stmt.Columns, p.identLower())
+		if p.peek().kind == tokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	if _, err := p.expect(tokRParen, ")"); err != nil {
+		return nil, err
 	}
 	return stmt, nil
 }
@@ -374,6 +429,7 @@ func (p *Parser) parseDrop() (Statement, error) {
 			return nil, fmt.Errorf("expected index name at pos %d", p.peek().pos)
 		}
 		stmt.Name = p.identLower()
+		p.acceptKeyword("on")
 		if p.peek().kind == tokIdent {
 			stmt.Table = p.identLower()
 		}

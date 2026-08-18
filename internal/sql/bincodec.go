@@ -367,11 +367,12 @@ func decodeStmt(r *bReader) (Statement, error) {
 	case bStmtDropTable:
 		return &DropTableStmt{Name: r.str(), IfExists: r.bool()}, nil
 	case bStmtCreateIndex:
-		s := &CreateIndexStmt{Name: r.str(), Table: r.str(), IfNotExists: r.bool()}
+		s := &CreateIndexStmt{Name: r.str(), Table: r.str()}
 		nc := int(r.uvarint())
 		for i := 0; i < nc; i++ {
 			s.Columns = append(s.Columns, r.str())
 		}
+		s.IfNotExists = r.bool()
 		return s, nil
 	case bStmtDropIndex:
 		return &DropIndexStmt{Name: r.str(), Table: r.str(), IfExists: r.bool()}, nil

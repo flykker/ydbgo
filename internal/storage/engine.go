@@ -53,6 +53,12 @@ func Open(dir string) (*Engine, error) {
 			return nil, err
 		}
 	}
+	// Rebuild secondary index entries from the persisted rows (index entries
+	// are a derived in-memory structure).
+	if err := e.rebuildIndexes(); err != nil {
+		st.Close()
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -85,6 +91,32 @@ func (e *Engine) Close() error {
 	var firstErr error
 	for _, st := range e.stores {
 		if err := st.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// lsmCompactor is implemented by stores whose backing LSM can be forced
+// through a full compaction.
+type lsmCompactor interface {
+	CompactLSM() error
+}
+
+// CompactLSM forces a full Pebble LSM compaction on every open store,
+// collapsing the freshly-written L0 SSTable runs after a bulk load. Reads then
+// hit a handful of merged tables instead of the short per-batch ones. Blocking
+// and expensive: for administrative use only (ADMIN COMPACT).
+func (e *Engine) CompactLSM() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var firstErr error
+	for _, st := range e.stores {
+		c, ok := st.(lsmCompactor)
+		if !ok {
+			continue
+		}
+		if err := c.CompactLSM(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -240,7 +272,7 @@ func (e *Engine) read(fn func(tx storeTx) error) error {
 // EstimateSize returns a rough byte estimate of all stored row data.
 func (e *Engine) EstimateSize() uint64 {
 	var n uint64
-	for _, name := range e.sortedTables() {
+	for _, name := range e.SortedTables() {
 		t := e.tables[name]
 		st := e.store(t.engine)
 		st.view(func(tx storeTx) error {
@@ -254,7 +286,7 @@ func (e *Engine) EstimateSize() uint64 {
 	return n
 }
 
-func (e *Engine) sortedTables() []string {
+func (e *Engine) SortedTables() []string {
 	names := make([]string, 0, len(e.tables))
 	for n := range e.tables {
 		names = append(names, n)

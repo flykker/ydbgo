@@ -122,3 +122,28 @@ func (b *builder) Variant(v sqlValue) {
 	}
 }
 func (b *builder) Bytes() []byte { return b.buf }
+
+// decodeNumericCell decodes a cell of a known numeric type directly from its
+// raw bytes, skipping the generic reader allocation. Cell layout is
+// [type][null][zigzag varint]. Returns the value as (intVal, floatVal), whether
+// the cell was null, and ok=false if the cell is not shaped as expected.
+func decodeNumericCell(cell []byte, want sqlType) (int64, float64, bool, bool) {
+	if len(cell) < 2 {
+		return 0, 0, false, false
+	}
+	if want == tFloat && len(cell) >= 2 && sqlType(cell[0]) != tFloat {
+		return 0, 0, false, false
+	}
+	if cell[1] == 1 {
+		return 0, 0, true, true // null
+	}
+	u, n := binary.Uvarint(cell[2:])
+	if n <= 0 {
+		return 0, 0, false, false
+	}
+	i := int64(u>>1) ^ -int64(u&1)
+	if want == tFloat {
+		return 0, math.Float64frombits(uint64(i)), false, true
+	}
+	return i, 0, false, true
+}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"ydbgo/internal/config"
 	"ydbgo/internal/server"
 )
 
@@ -18,7 +19,10 @@ Usage:
   ydbgo serve -raft-addr R:PORT [-node-id ID]               start as a cluster node
            [-bootstrap] [-join HOST:PORT] [-rf N] [-shard-size BYTES]
            [-split-check DURATION] [-recovery-check DURATION] [-ttl-tick DURATION]
-           [-addr ...]
+           [-http :8080] [-pprof :6060]                     web console / pprof
+  ydbgo serve -config cluster.yaml [-node-id ID]            start from a YDB-style
+           cluster config: topology/addr/data/join are taken from the file,
+           explicit flags still win
   ydbgo run [-addr host:port] SQL...                        execute SQL against a server
   ydbgo repl [-addr host:port]                              interactive shell
   ydbgo bench -addr host:port [-n N] [-rows R] [-c C]       benchmark concurrent inserts
@@ -28,6 +32,8 @@ Examples:
   ydbgo serve -addr :2135 -data ./data
   ydbgo serve -addr :2135 -data ./n1 -raft-addr 127.0.0.1:7001 -node-id n1 -bootstrap
   ydbgo serve -addr :2136 -data ./n2 -raft-addr 127.0.0.1:7002 -node-id n2 -join 127.0.0.1:2135
+  ydbgo serve -config cluster.yaml -node-id n1
+  ydbgo serve -config cluster.yaml -node-id n2
   ydbgo run -addr :2135 "CREATE TABLE users (id int64 primary key, v string)"
   ydbgo run -addr :2135 "ADMIN SHARDS users"
   ydbgo run -addr :2135 "ADMIN SPLIT TABLE users AT 500"
@@ -58,6 +64,7 @@ func main() {
 
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	configPath := fs.String("config", "", "YDB-style cluster config (YAML); topology/addr/join come from it, explicit flags win")
 	addr := fs.String("addr", ":2135", "listen address")
 	data := fs.String("data", "./ydbgo-data", "data directory")
 	id := fs.String("node-id", "", "raft node id (defaults to raft-addr)")
@@ -70,27 +77,66 @@ func runServe(args []string) {
 	recoveryTick := fs.Duration("recovery-check", 0, "replica-heal check interval (0 = disabled)")
 	ttlTick := fs.Duration("ttl-tick", 0, "auto-TTL purge check interval (0 = disabled)")
 	pprofAddr := fs.String("pprof", "", "optional HTTP pprof listen address (e.g. :6060)")
+	httpAddr := fs.String("http", "", "optional embedded web console listen address (e.g. :8080)")
 	fs.Parse(args)
 	if *pprofAddr != "" {
 		startPprof(*pprofAddr)
 	}
+	if *configPath != "" {
+		cfg, err := config.Load(*configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(2)
+		}
+		node, err := cfg.SelectNode(*id)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(2)
+		}
+		if err := config.Apply(fs, node, cfg.JoinTarget(node)); err != nil {
+			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(2)
+		}
+	}
 	if *raftAddr == "" {
-		if err := server.RunServer(*addr, *data); err != nil {
+		if err := server.RunServer(*addr, *data, *httpAddr); err != nil {
 			fmt.Fprintln(os.Stderr, "serve:", err)
 			os.Exit(1)
 		}
 		return
 	}
-	if err := server.RunClusterServer(*addr, *data, *id, *raftAddr, *bootstrap, *join, *rf, *shardSize, *splitTick, *recoveryTick, *ttlTick); err != nil {
+	if err := server.RunClusterServer(*addr, *data, *id, *raftAddr, *httpAddr, *bootstrap, *join, *rf, *shardSize, *splitTick, *recoveryTick, *ttlTick); err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		os.Exit(1)
 	}
 }
 
+// applyClientConfig points run/repl/bench at the bootstrap node of a cluster
+// config unless the user passed an explicit -addr.
+func applyClientConfig(fs *flag.FlagSet, cfg *config.Config) error {
+	b := cfg.BootstrapHost()
+	if b == nil {
+		return fmt.Errorf("config: no bootstrap host found")
+	}
+	return config.Apply(fs, b, "")
+}
+
 func runClient(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:2135", "server address")
+	configPath := fs.String("config", "", "cluster config (default addr = bootstrap node)")
 	fs.Parse(args)
+	if *configPath != "" {
+		cfg, err := config.Load(*configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run:", err)
+			os.Exit(2)
+		}
+		if err := applyClientConfig(fs, cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "run:", err)
+			os.Exit(2)
+		}
+	}
 	rest := fs.Args()
 	if len(rest) == 0 {
 		fmt.Fprintln(os.Stderr, "run: no SQL given")
@@ -105,7 +151,19 @@ func runClient(args []string) {
 func runRepl(args []string) {
 	fs := flag.NewFlagSet("repl", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:2135", "server address")
+	configPath := fs.String("config", "", "cluster config (default addr = bootstrap node)")
 	fs.Parse(args)
+	if *configPath != "" {
+		cfg, err := config.Load(*configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "repl:", err)
+			os.Exit(2)
+		}
+		if err := applyClientConfig(fs, cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "repl:", err)
+			os.Exit(2)
+		}
+	}
 	if err := server.RunClient(*addr, nil); err != nil {
 		fmt.Fprintln(os.Stderr, "repl:", err)
 		os.Exit(1)

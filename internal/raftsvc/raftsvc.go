@@ -52,13 +52,17 @@ func (f *FSM) Apply(l *raft.Log) interface{} {
 	return results
 }
 
-// Snapshot serializes the current engine state as the FSM snapshot payload.
+// Snapshot captures a point-in-time engine view as the FSM snapshot payload.
+// It only pins store snapshots (fast, no row reads) and must NOT do heavy
+// work: it runs on the raft FSM goroutine, and blocking there stalls log
+// applies, which loses the raft quorum and hangs the whole cluster. Heavy
+// serialization happens in Persist, on raft's dedicated snapshot goroutine.
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
-	data, err := f.eng.MarshalState()
+	snap, err := f.eng.CaptureSnapshot()
 	if err != nil {
 		return nil, err
 	}
-	return &snapshot{data: data}, nil
+	return &snapshot{eng: f.eng, snap: snap}, nil
 }
 
 // Restore rebuilds the engine from a snapshot payload and rewrites the WAL
@@ -73,17 +77,24 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 }
 
 type snapshot struct {
-	data []byte
+	eng  *storage.Engine
+	snap *storage.EngineSnap
 }
 
 func (s *snapshot) Persist(sink raft.SnapshotSink) error {
-	if _, err := sink.Write(s.data); err != nil {
+	data, err := s.eng.MarshalSnap(s.snap)
+	s.snap.Release()
+	if err != nil {
+		sink.Cancel()
+		return err
+	}
+	if _, err := sink.Write(data); err != nil {
 		sink.Cancel()
 		return err
 	}
 	return sink.Close()
 }
-func (s *snapshot) Release() {}
+func (s *snapshot) Release() { s.snap.Release() }
 
 // Node is a Raft-backed replica of a single table's data (one shard group)
 // or, in the legacy single-group mode, the whole database.

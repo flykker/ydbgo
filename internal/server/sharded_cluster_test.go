@@ -225,6 +225,75 @@ func TestShardedKVRaw(t *testing.T) {
 }
 
 // TestShardedCStore exercises the columnar backend over a sharded cluster.
+// TestShardedAdminCompact verifies ADMIN COMPACT forces an LSM compaction on
+// every local shard group and that reads still return identical results after
+// the merged tables replace the freshly-written runs.
+func TestShardedAdminCompact(t *testing.T) {
+	n1 := startClusterNode(t, "n1", freePort(t), "", 2)
+	defer n1.stop()
+	n2 := startClusterNode(t, "n2", freePort(t), n1.sql1, 2)
+	defer n2.stop()
+
+	execOK(t, n1.c, "CREATE TABLE cs_t (id int64 primary key, v string, score int64) ENGINE=CSTORE")
+	execOK(t, n1.c, "INSERT INTO cs_t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM cs_t", "3", 15*time.Second)
+
+	r := execOK(t, n1.c, "SELECT SUM(score) AS s, COUNT(*) AS c FROM cs_t")
+	if len(r.Result.Rows) != 1 || r.Result.Rows[0][0] != "60" || r.Result.Rows[0][1] != "3" {
+		t.Fatalf("pre-compact aggregate: %v", r.Result.Rows)
+	}
+
+	// compact every node's shard stores, then verify identical reads
+	for _, n := range []*shardNode{n1, n2} {
+		execOK(t, n.c, "ADMIN COMPACT")
+	}
+
+	r = execOK(t, n1.c, "SELECT SUM(score) AS s, COUNT(*) AS c FROM cs_t")
+	if len(r.Result.Rows) != 1 || r.Result.Rows[0][0] != "60" || r.Result.Rows[0][1] != "3" {
+		t.Fatalf("post-compact aggregate: %v", r.Result.Rows)
+	}
+	r = execOK(t, n2.c, "SELECT v FROM cs_t WHERE id = 2")
+	if len(r.Result.Rows) != 1 || r.Result.Rows[0][0] != "b" {
+		t.Fatalf("post-compact point read: %v", r.Result.Rows)
+	}
+}
+
+// TestShardedDropTableRecreate verifies DROP TABLE physically destroys every
+// shard replica so re-creating a table with the same name starts empty. The
+// bug: shard IDs are deterministic (table + split path), so a re-created table
+// reused the old shard directories whose raft log was resumed, resurrecting
+// the dropped rows.
+func TestShardedDropTableRecreate(t *testing.T) {
+	n1 := startClusterNode(t, "n1", freePort(t), "", 2)
+	defer n1.stop()
+	n2 := startClusterNode(t, "n2", freePort(t), n1.sql1, 2)
+	defer n2.stop()
+
+	execOK(t, n1.c, "CREATE TABLE dt (id int64 primary key, v string, score int64) ENGINE=CSTORE")
+	execOK(t, n1.c, "INSERT INTO dt VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM dt", "3", 15*time.Second)
+
+	// spread across shards so multiple shard groups hold data
+	execOK(t, n1.c, "ADMIN SPLIT TABLE dt AT 2")
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM dt", "3", 15*time.Second)
+
+	// drop, then recreate with the same name
+	execOK(t, n1.c, "DROP TABLE dt")
+	execOK(t, n1.c, "CREATE TABLE dt (id int64 primary key, v string, score int64) ENGINE=CSTORE")
+
+	// a fresh table must be empty on every node (no resurrected rows)
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM dt", "0", 15*time.Second)
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM dt", "0", 15*time.Second)
+
+	// writes land on the fresh table only
+	execOK(t, n2.c, "INSERT INTO dt VALUES (9, 'nine', 90)")
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM dt", "1", 15*time.Second)
+	r := execOK(t, n1.c, "SELECT v FROM dt WHERE id = 9")
+	if len(r.Result.Rows) != 1 || r.Result.Rows[0][0] != "nine" {
+		t.Fatalf("fresh table point read: %v", r.Result.Rows)
+	}
+}
+
 func TestShardedCStore(t *testing.T) {
 	n1 := startClusterNode(t, "n1", freePort(t), "", 2)
 	defer n1.stop()
@@ -256,6 +325,43 @@ func TestShardedCStore(t *testing.T) {
 	r = execOK(t, n1.c, "SELECT v FROM cs_t ORDER BY id")
 	if len(r.Result.Rows) != 4 || r.Result.Rows[0][0] != "a" || r.Result.Rows[3][0] != "nine" {
 		t.Fatalf("projected scan: %v", r.Result.Rows)
+	}
+}
+
+// TestShardedTopN verifies ORDER BY PK ... LIMIT pushdown across a split
+// CSTORE table: each shard answers with its own top rows (bounded PK-index
+// scan), the coordinator merges/re-sorts them, and replication neither
+// duplicates nor drops rows.
+func TestShardedTopN(t *testing.T) {
+	n1 := startClusterNode(t, "n1", freePort(t), "", 2)
+	defer n1.stop()
+	n2 := startClusterNode(t, "n2", freePort(t), n1.sql1, 2)
+	defer n2.stop()
+
+	execOK(t, n1.c, "CREATE TABLE logs (id int64 primary key, v string) ENGINE=CSTORE")
+	for i := 0; i < 12; i++ {
+		execOK(t, n1.c, fmt.Sprintf("INSERT INTO logs VALUES (%d, 'v%d')", i, i))
+	}
+	execOK(t, n1.c, "ADMIN SPLIT TABLE logs AT 5")
+	execOK(t, n1.c, "ADMIN SPLIT TABLE logs AT 9")
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM logs", "12", 15*time.Second)
+
+	// top-4 descending spans all three shards
+	r := execOK(t, n1.c, "SELECT id FROM logs ORDER BY id DESC LIMIT 4")
+	if len(r.Result.Rows) != 4 || r.Result.Rows[0][0] != "11" || r.Result.Rows[3][0] != "8" {
+		t.Fatalf("topn desc: %v", r.Result.Rows)
+	}
+
+	// top-2 ascending
+	r = execOK(t, n1.c, "SELECT id FROM logs ORDER BY id ASC LIMIT 2")
+	if len(r.Result.Rows) != 2 || r.Result.Rows[0][0] != "0" || r.Result.Rows[1][0] != "1" {
+		t.Fatalf("topn asc: %v", r.Result.Rows)
+	}
+
+	// restricted to a range spanning two shards
+	r = execOK(t, n1.c, "SELECT id FROM logs WHERE id >= 4 AND id < 10 ORDER BY id DESC LIMIT 3")
+	if len(r.Result.Rows) != 3 || r.Result.Rows[0][0] != "9" || r.Result.Rows[2][0] != "7" {
+		t.Fatalf("topn range: %v", r.Result.Rows)
 	}
 }
 
@@ -340,10 +446,70 @@ func TestShardedCStoreAggPushdown(t *testing.T) {
 	// aggregate fully inside one shard (the other is skipped)
 	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM logs WHERE ts >= '2024-01-01T20:00:00Z' AND ts < '2024-01-02T00:00:00Z'", "4", 15*time.Second)
 
-	// non-PK filter cannot be pushed to partial aggregates: falls back to the
-	// row path but must still agree
+	// non-PK equality filter is pushed as a columnar predicate to the partial
+	// aggregate on each shard (no rows cross the wire)
 	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM logs WHERE level = 'ERROR'", "8", 15*time.Second)
 	waitQuery(t, n2.c, "SELECT SUM(lat) AS s FROM logs WHERE level = 'INFO' AND ts >= '2024-01-01T00:00:00Z' AND ts < '2024-01-01T12:00:00Z'", "480", 15*time.Second)
+}
+
+// TestShardedCStorePredicatePushdown verifies a leading-literal LIKE on a
+// non-PK column is pushed into the columnar scan/aggregate on each shard
+// (COUNT with no rows crossing the wire), while a leading-wildcard pattern
+// falls back to the row path and must still agree.
+func TestShardedCStorePredicatePushdown(t *testing.T) {
+	n1 := startClusterNode(t, "n1", freePort(t), "", 2)
+	defer n1.stop()
+	n2 := startClusterNode(t, "n2", freePort(t), n1.sql1, 2)
+	defer n2.stop()
+
+	execOK(t, n1.c, "CREATE TABLE logs (ts timestamp primary key, level string, lat int64) ENGINE=CSTORE")
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	for h := 0; h < 24; h++ {
+		level := "INFO"
+		if h%3 == 0 {
+			level = "ERROR"
+		}
+		ts := base.Add(time.Duration(h) * time.Hour)
+		execOK(t, n1.c, fmt.Sprintf("INSERT INTO logs VALUES ('%s', '%s', %d)", ts.Format(time.RFC3339Nano), level, h*10))
+	}
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM logs", "24", 15*time.Second)
+	execOK(t, n1.c, "ADMIN SPLIT TABLE logs AT '2024-01-01T12:00:00Z'")
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM logs", "24", 15*time.Second)
+
+	// COUNT(*) filtered by a leading-literal LIKE prefix on a non-PK column,
+	// across both shards
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM logs WHERE level LIKE 'ERRO%'", "8", 15*time.Second)
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM logs WHERE level LIKE 'INFO%'", "16", 15*time.Second)
+
+	// aggregate over a column while filtering on a different column
+	waitQuery(t, n2.c, "SELECT SUM(lat) AS s FROM logs WHERE level LIKE 'ERRO%'", "840", 15*time.Second)
+	waitQuery(t, n1.c, "SELECT AVG(lat) AS a FROM logs WHERE level LIKE 'INFO%'", "120", 15*time.Second)
+
+	// equality on a non-PK column pushed as a predicate
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM logs WHERE level = 'ERROR'", "8", 15*time.Second)
+
+	// LIKE with an equality-only pattern (no wildcard) folds to a predicate
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM logs WHERE level LIKE 'INFO'", "16", 15*time.Second)
+
+	// leading wildcard cannot be folded: falls back to the row path, still right
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM logs WHERE level LIKE '%RROR'", "8", 15*time.Second)
+	// mid-pattern wildcard: same fallback
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM logs WHERE level LIKE 'E%OR'", "8", 15*time.Second)
+
+	// PK window ANDed with a LIKE predicate: range + predicate both applied
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM logs WHERE ts >= '2024-01-01T00:00:00Z' AND ts < '2024-01-01T12:00:00Z' AND level LIKE 'ERRO%'", "4", 15*time.Second)
+	waitQuery(t, n1.c, "SELECT SUM(lat) AS s FROM logs WHERE ts >= '2024-01-01T12:00:00Z' AND level LIKE 'INFO%'", "1440", 15*time.Second)
+
+	// plain projected scan with a LIKE predicate
+	r := execOK(t, n2.c, "SELECT level FROM logs WHERE level LIKE 'ERRO%' ORDER BY ts")
+	if len(r.Result.Rows) != 8 {
+		t.Fatalf("projected LIKE scan: %v", r.Result.Rows)
+	}
+	for _, row := range r.Result.Rows {
+		if len(row) == 0 || row[0] != "ERROR" {
+			t.Fatalf("projected LIKE scan row: %v", row)
+		}
+	}
 }
 
 // TestShardedCStoreRetention verifies a time-based retention delete spreads to

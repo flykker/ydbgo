@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"ydbgo/internal/config"
 	"ydbgo/internal/proto"
 )
 
@@ -17,11 +18,23 @@ import (
 func runBench(args []string) {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:2135", "server address")
+	configPath := fs.String("config", "", "cluster config (default addr = bootstrap node)")
 	statements := fs.Int("n", 10000, "number of write statements to run")
 	rows := fs.Int("rows", 100, "rows per INSERT statement")
 	conc := fs.Int("c", 8, "concurrency")
 	table := fs.String("table", "bench", "table name")
 	fs.Parse(args)
+	if *configPath != "" {
+		cfg, err := config.Load(*configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bench:", err)
+			os.Exit(2)
+		}
+		if err := applyClientConfig(fs, cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "bench:", err)
+			os.Exit(2)
+		}
+	}
 
 	pool := proto.NewConnPool(*conc)
 	defer pool.Close()

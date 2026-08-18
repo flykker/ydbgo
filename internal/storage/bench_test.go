@@ -85,3 +85,125 @@ func BenchmarkOLAP(b *testing.B) {
 		e.Close()
 	}
 }
+
+// BenchmarkIndex compares the filtered columnar scan against the secondary
+// index fast path for equality and leading-literal LIKE predicates on a
+// CSTORE table (idx / scan sub-benchmarks).
+func BenchmarkIndex(b *testing.B) {
+	queries := []struct {
+		name string
+		sql  string
+	}{
+		{"eq_rare", "SELECT COUNT(*) FROM %s WHERE cat = 'cat3'"},
+		{"eq_dense", "SELECT COUNT(*) FROM %s WHERE cat = 'cat0'"},
+		{"like", "SELECT COUNT(*) FROM %s WHERE cat LIKE 'cat1%%'"},
+	}
+	for _, q := range queries {
+		for _, indexed := range []bool{false, true} {
+			e, ex, tn := benchOLAPEngine(b, "CSTORE")
+			label := "scan"
+			if indexed {
+				label = "index"
+				if _, err := ex.Execute(mustParse(b, "CREATE INDEX ix_cat ON "+tn+" (cat)")[0]); err != nil {
+					b.Fatal(err)
+				}
+			}
+			st := mustParse(b, fmt.Sprintf(q.sql, tn))[0]
+			b.Run(label+"/"+q.name, func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := ex.Execute(st); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			e.Close()
+		}
+	}
+}
+
+// BenchmarkBatchInsert compares inserting N rows one Put at a time against the
+// single-transaction BatchInsert API (same engine, isolated from raft).
+func BenchmarkBatchInsert(b *testing.B) {
+	for _, batch := range []int{1, 10, 100, 1000} {
+		e, err := Open(b.TempDir() + "/db")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := e.CreateTable(&sqlx.TableSchema{
+			Name:    "t",
+			Columns: []sqlx.ColumnDef{{Name: "id", Type: sqlx.TypeInt}, {Name: "v", Type: sqlx.TypeString}},
+			PK:      []string{"id"},
+			Engine:  "CSTORE",
+		}); err != nil {
+			b.Fatal(err)
+		}
+		rows := make([]map[string]sqlx.Value, batch)
+		for i := range rows {
+			rows[i] = map[string]sqlx.Value{"id": sqlx.IntValue(int64(i)), "v": sqlx.StrValue("value")}
+		}
+		b.Run(fmt.Sprintf("batch%d", batch), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := e.BatchInsert("t", rows); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("perrow%d", batch), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for _, r := range rows {
+					if err := e.Insert("t", r); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+		e.Close()
+	}
+}
+
+// BenchmarkCStoreGroupedDirect measures just the columnar grouped-aggregate
+// engine call (no SQL parsing/planning overhead).
+func BenchmarkCStoreGroupedDirect(b *testing.B) {
+	e, ex, tn := benchOLAPEngine(b, "CSTORE")
+	defer e.Close()
+	_ = ex
+	tn = "bt_cstore"
+	gi := -1
+	for i, c := range e.mustSchema(b, tn).Columns {
+		if c.Name == "cat" {
+			gi = i
+		}
+	}
+	if gi < 0 {
+		b.Fatal("no cat column")
+	}
+	sc := -1
+	for i, c := range e.mustSchema(b, tn).Columns {
+		if c.Name == "score" {
+			sc = i
+		}
+	}
+	gas := []sqlx.GroupAgg{{Col: -1, Aggs: []string{"count"}}, {Col: sc, Aggs: []string{"sum"}}, {Col: sc, Aggs: []string{"count"}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := e.ColumnGroupedAggregates(tn, gi, gas, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func (e *Engine) mustSchema(b testing.TB, name string) *sqlx.TableSchema {
+	b.Helper()
+	s, err := e.GetSchema(name)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return s
+}
