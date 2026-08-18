@@ -599,6 +599,8 @@ func normalizeEngine(e string) string {
 		return "KV"
 	case "cstore":
 		return "CSTORE"
+	case "cstore2":
+		return "CSTORE2"
 	default:
 		return "TABLE"
 	}
@@ -850,7 +852,7 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 	// For CSTORE tables push a projected SELECT down to each shard so shard
 	// nodes run columnar scans over only the columns the query touches.
 	var proj []string
-	if ts.Schema.Engine == "CSTORE" {
+	if sqlx.IsColumnarEngine(ts.Schema.Engine) {
 		if cols, full := sqlx.ProjectionColumns(ts.Schema, st); !full {
 			proj = cols
 		}
@@ -869,7 +871,7 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 	// executor answers it with a bounded PK-index scan), then the coordinator
 	// re-orders the few shard tops and applies the global limit.
 	topTail := ""
-	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || whereExact) {
+	if sqlx.IsColumnarEngine(ts.Schema.Engine) && (st.Where == nil || whereExact) {
 		if pk, desc, limit, ok := sqlx.PlanTopN(st, ts.Schema); ok {
 			dir := "ASC"
 			if desc {
@@ -894,7 +896,7 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 	}
 	// For CSTORE whole-table aggregate SELECTs push mergeable partial
 	// aggregates down to each shard and combine them: no rows cross the wire.
-	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || whereExact) {
+	if sqlx.IsColumnarEngine(ts.Schema.Engine) && (st.Where == nil || whereExact) {
 		if plan, ok := sqlx.PlanAggregate(st, ts.Schema); ok {
 			ptypes := plan.PartialTypes(ts.Schema)
 			partials, err := m.parallelShardRows(shards, func(spec *ShardSpec) bool { return skipShard(spec) }, func(spec *ShardSpec) ([]sqlx.Row, error) {
@@ -909,7 +911,7 @@ func (m *Manager) execSelect(st *sqlx.SelectStmt) (*sqlx.Result, error) {
 	}
 	// For CSTORE single-column GROUP BY push partial groups down to each shard
 	// and merge groups with equal keys: only group rows cross the wire.
-	if ts.Schema.Engine == "CSTORE" && (st.Where == nil || whereExact) {
+	if sqlx.IsColumnarEngine(ts.Schema.Engine) && (st.Where == nil || whereExact) {
 		if plan, ok := sqlx.PlanGrouped(st, ts.Schema); ok {
 			ptypes := plan.PartialTypes(ts.Schema)
 			partials, err := m.parallelShardRows(shards, func(spec *ShardSpec) bool { return skipShard(spec) }, func(spec *ShardSpec) ([]sqlx.Row, error) {

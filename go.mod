@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/hashicorp/raft v1.7.3
+	github.com/pierrec/lz4/v4 v4.1.21
 	google.golang.org/grpc v1.83.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1

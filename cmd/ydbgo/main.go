@@ -25,10 +25,8 @@ Usage:
            explicit flags still win
   ydbgo run [-addr host:port] SQL...                        execute SQL against a server
   ydbgo repl [-addr host:port]                              interactive shell
-  ydbgo bench -addr host:port [-n N] [-rows R] [-c C]       benchmark concurrent inserts
-  ydbgo run -addr host:port @FILE.sql                       run statements from a file
-
-Examples:
+  ydbgo bench -addr host:port [-n N] [-rows R] [-c C] [-engine TABLE|KV|CSTORE|CSTORE2]
+  ydbgo run -addr host:port @FILE.sql                       run statements from a fileExamples:
   ydbgo serve -addr :2135 -data ./data
   ydbgo serve -addr :2135 -data ./n1 -raft-addr 127.0.0.1:7001 -node-id n1 -bootstrap
   ydbgo serve -addr :2136 -data ./n2 -raft-addr 127.0.0.1:7002 -node-id n2 -join 127.0.0.1:2135

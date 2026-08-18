@@ -328,6 +328,54 @@ func TestShardedCStore(t *testing.T) {
 	}
 }
 
+// TestShardedMpart drives the native columnar ENGINE=CSTORE2 backend through
+// the full sharded path: replication, split, aggregate/group pushdown, range
+// delete and compaction, mirroring TestShardedCStore.
+func TestShardedMpart(t *testing.T) {
+	n1 := startClusterNode(t, "n1", freePort(t), "", 2)
+	defer n1.stop()
+	n2 := startClusterNode(t, "n2", freePort(t), n1.sql1, 2)
+	defer n2.stop()
+
+	execOK(t, n1.c, "CREATE TABLE mp_t (id int64 primary key, v string, score int64) ENGINE=CSTORE2")
+	execOK(t, n1.c, "INSERT INTO mp_t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM mp_t", "3", 15*time.Second)
+
+	// read by key via n2 (routes to the shard owning id=2)
+	r := execOK(t, n2.c, "SELECT v FROM mp_t WHERE id = 2")
+	if len(r.Result.Rows) != 1 || r.Result.Rows[0][0] != "b" {
+		t.Fatalf("mpart select via n2: %v", r.Result.Rows)
+	}
+
+	// split and keep writing/reading
+	execOK(t, n1.c, "ADMIN SPLIT TABLE mp_t AT 2")
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM mp_t", "3", 15*time.Second)
+	execOK(t, n2.c, "INSERT INTO mp_t VALUES (9, 'nine', 90)")
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM mp_t", "4", 15*time.Second)
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM mp_t", "4", 15*time.Second)
+
+	// aggregate + grouped pushdown across both shards
+	waitQuery(t, n2.c, "SELECT SUM(score) AS s FROM mp_t", "150", 15*time.Second)
+	waitQuery(t, n1.c, "SELECT MAX(score) AS m FROM mp_t", "90", 15*time.Second)
+	if r := execOK(t, n2.c, "SELECT v, COUNT(*) FROM mp_t GROUP BY v"); len(r.Result.Rows) != 4 {
+		t.Fatalf("grouped pushdown: %v", r.Result.Rows)
+	}
+
+	// column projection across the split
+	r = execOK(t, n1.c, "SELECT v FROM mp_t ORDER BY id")
+	if len(r.Result.Rows) != 4 || r.Result.Rows[0][0] != "a" || r.Result.Rows[3][0] != "nine" {
+		t.Fatalf("projected scan: %v", r.Result.Rows)
+	}
+
+	// range delete (retention) replicates to the follower
+	execOK(t, n1.c, "DELETE FROM mp_t WHERE id >= 2 AND id < 3")
+	waitQuery(t, n2.c, "SELECT COUNT(*) AS c FROM mp_t", "3", 15*time.Second)
+	r = execOK(t, n2.c, "SELECT SUM(score) AS s FROM mp_t")
+	if r.Result.Rows[0][0] != "130" {
+		t.Fatalf("sum after retention: %v", r.Result.Rows)
+	}
+}
+
 // TestShardedTopN verifies ORDER BY PK ... LIMIT pushdown across a split
 // CSTORE table: each shard answers with its own top rows (bounded PK-index
 // scan), the coordinator merges/re-sorts them, and replication neither

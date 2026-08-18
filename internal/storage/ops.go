@@ -301,14 +301,14 @@ func (e *Engine) DeleteRange(table string, r *sqlx.PKRange) (int64, error) {
 		if err != nil {
 			return err
 		}
-		if t.engine != "CSTORE" {
-			return fmt.Errorf("range delete requires a CSTORE table")
+		if t.engine != "CSTORE" && t.engine != "CSTORE2" {
+			return fmt.Errorf("range delete requires a columnar table")
 		}
 		plLower, plUpper := PKRangeBytes(r)
 		return e.writeTo(e.store(t.engine), func(tx storeTx) error {
-			ct, ok := tx.(*cstoreTx)
+			ct, ok := tx.(columnarTx)
 			if !ok {
-				return errors.New("range delete requires the CSTORE store")
+				return errors.New("range delete requires a columnar store")
 			}
 			var pks [][]byte
 			if err := ct.colRowKeysRange(t.name, plLower, plUpper, func(pk []byte) error {
@@ -352,10 +352,10 @@ func (e *Engine) DeleteRange(table string, r *sqlx.PKRange) (int64, error) {
 	return affected, nil
 }
 
-// Compact physically removes superseded KV versions of a CSTORE table's
-// store, keeping only the newest version of each key (a no-op for the latest
-// revision). This is the space-reclaim companion to range deletes: retention
-// tombstones plus older live versions are dropped.
+// Compact physically reclaims space for a columnar table. For CSTORE it drops
+// superseded KV versions keeping only the newest of each key (the companion to
+// range deletes); for CSTORE2 it merges the table's mem + parts, dropping
+// tombstoned rows and rewriting fresh parts.
 func (e *Engine) Compact(table string) (int64, error) {
 	unlock := e.writeLock()
 	defer unlock()
@@ -363,11 +363,13 @@ func (e *Engine) Compact(table string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	cs, ok := e.store(t.engine).(*cstoreStore)
-	if !ok {
-		return 0, errors.New("compaction requires the CSTORE store")
+	switch st := e.store(t.engine).(type) {
+	case *cstoreStore:
+		return st.st.Compact(st.st.Latest())
+	case *mpartStore:
+		return st.compactTable(t.name)
 	}
-	return cs.st.Compact(cs.st.Latest())
+	return 0, errors.New("compaction requires a columnar store")
 }
 
 // Scan implements sqlx.Engine.
@@ -576,8 +578,8 @@ func engineOf(e string) string {
 	switch e {
 	case "KV":
 		return "KV"
-	case "CSTORE":
-		return "CSTORE"
+	case "CSTORE", "CSTORE2":
+		return e
 	default:
 		return "TABLE"
 	}

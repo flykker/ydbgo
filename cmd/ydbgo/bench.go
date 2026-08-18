@@ -23,6 +23,7 @@ func runBench(args []string) {
 	rows := fs.Int("rows", 100, "rows per INSERT statement")
 	conc := fs.Int("c", 8, "concurrency")
 	table := fs.String("table", "bench", "table name")
+	engine := fs.String("engine", "TABLE", "storage engine (TABLE, KV, CSTORE, CSTORE2)")
 	fs.Parse(args)
 	if *configPath != "" {
 		cfg, err := config.Load(*configPath)
@@ -54,7 +55,11 @@ func runBench(args []string) {
 			os.Exit(1)
 		}
 	}
-	mustExec(fmt.Sprintf("CREATE TABLE %s (id int64 primary key, v string)", *table))
+	if *engine == "" || *engine == "TABLE" {
+		mustExec(fmt.Sprintf("CREATE TABLE %s (id int64 primary key, v string, g int64)", *table))
+	} else {
+		mustExec(fmt.Sprintf("CREATE TABLE %s (id int64 primary key, v string, g int64) ENGINE=%s", *table, *engine))
+	}
 	mustExec(fmt.Sprintf("DELETE FROM %s", *table))
 
 	var next int64
@@ -146,14 +151,15 @@ func runBench(args []string) {
 	}
 }
 
-// buildBatch renders an INSERT with `rows` consecutive ids starting at base.
+// buildBatch renders an INSERT with `rows` consecutive ids starting at base
+// and a low-cardinality group column g = id % 100 (drives GROUP BY pushdown).
 func buildBatch(table string, base int64, rows int) string {
 	q := "INSERT INTO " + table + " VALUES "
 	for i := 0; i < rows; i++ {
 		if i > 0 {
 			q += ","
 		}
-		q += fmt.Sprintf("(%d,'v%d')", base+int64(i), base+int64(i))
+		q += fmt.Sprintf("(%d,'v%d',%d)", base+int64(i), base+int64(i), (base+int64(i))%100)
 	}
 	return q
 }

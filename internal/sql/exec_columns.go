@@ -82,7 +82,7 @@ type ColumnEngine interface {
 // the primary-key range derived from WHERE; everything else uses a full scan.
 func (ex *Executor) rowsFor(s *SelectStmt, schema *TableSchema) ([]Row, error) {
 	ce, _ := ex.Eng.(ColumnEngine)
-	if schema == nil || schema.Engine != "CSTORE" || ce == nil {
+	if schema == nil || !IsColumnarEngine(schema.Engine) || ce == nil {
 		return ex.Eng.Scan(s.From)
 	}
 	rng, pred, _ := PlanWhere(schema, s.Where)
@@ -105,7 +105,7 @@ func (ex *Executor) rowsFor(s *SelectStmt, schema *TableSchema) ([]Row, error) {
 // non-PK predicate). Aggregates over the same column are combined into one
 // columnar scan.
 func (ex *Executor) aggregatePushdown(s *SelectStmt, schema *TableSchema) (*Result, bool, error) {
-	if schema == nil || schema.Engine != "CSTORE" ||
+	if schema == nil || !IsColumnarEngine(schema.Engine) ||
 		len(s.GroupBy) > 0 || len(s.OrderBy) > 0 || s.HasLimit {
 		return nil, false, nil
 	}
@@ -216,7 +216,7 @@ func (ex *Executor) aggregatePushdown(s *SelectStmt, schema *TableSchema) (*Resu
 // or an aggregate call, with no ORDER BY. The WHERE (if any) must be fully
 // consumed as a primary-key range.
 func (ex *Executor) groupedPushdown(s *SelectStmt, schema *TableSchema) (*Result, bool, error) {
-	if schema == nil || schema.Engine != "CSTORE" || len(s.GroupBy) != 1 ||
+	if schema == nil || !IsColumnarEngine(schema.Engine) || len(s.GroupBy) != 1 ||
 		len(s.OrderBy) > 0 {
 		return nil, false, nil
 	}
@@ -1180,7 +1180,7 @@ func expandSelectItems(s *SelectStmt, schema *TableSchema) []*SelectItem {
 // GROUP BY / aggregates / DISTINCT. It returns the PK column list, direction
 // and limit.
 func PlanTopN(s *SelectStmt, schema *TableSchema) (pk []string, desc bool, limit int64, ok bool) {
-	if schema == nil || schema.Engine != "CSTORE" || len(s.GroupBy) > 0 || s.Distinct || !s.HasLimit {
+	if schema == nil || !IsColumnarEngine(schema.Engine) || len(s.GroupBy) > 0 || s.Distinct || !s.HasLimit {
 		return nil, false, 0, false
 	}
 	for _, it := range s.Items {

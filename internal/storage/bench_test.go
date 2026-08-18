@@ -64,7 +64,7 @@ func BenchmarkOLAP(b *testing.B) {
 		{"groupby", "SELECT cat, COUNT(*), SUM(score) FROM %s GROUP BY cat"},
 		{"groupby_range", "SELECT cat, COUNT(*) FROM %s WHERE id >= 2000 AND id < 5000 GROUP BY cat"},
 	}
-	for _, engine := range []string{"", "CSTORE"} {
+	for _, engine := range []string{"", "CSTORE", "CSTORE2"} {
 		label := "TABLE"
 		if engine != "" {
 			label = engine
@@ -206,4 +206,58 @@ func (e *Engine) mustSchema(b testing.TB, name string) *sqlx.TableSchema {
 		b.Fatal(err)
 	}
 	return s
+}
+
+// BenchmarkRead1M compares CSTORE against CSTORE2 on OLAP-shaped reads over a
+// 1M-row table that has been flushed to multiple parts. The read-path
+// optimizations (k-way merge, memoized per-part columns, point-PK fast path)
+// target exactly these queries.
+func BenchmarkRead1M(b *testing.B) {
+	queries := []struct {
+		name, sql string
+	}{
+		{"sum", "SELECT SUM(id) FROM %s"},
+		{"count", "SELECT COUNT(*) FROM %s"},
+		{"groupby", "SELECT g, COUNT(*) FROM %s GROUP BY g"},
+		{"orderby_desc_limit", "SELECT id FROM %s ORDER BY id DESC LIMIT 10"},
+		{"point", "SELECT v FROM %s WHERE id = 42"},
+	}
+	for _, engine := range []string{"CSTORE", "CSTORE2"} {
+		e, ex, tn := bench1MEngine(b, engine)
+		for _, q := range queries {
+			st := mustParse(b, fmt.Sprintf(q.sql, tn))[0]
+			b.Run(engine+"/"+q.name, func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := ex.Execute(st); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+		e.Close()
+	}
+}
+
+func bench1MEngine(b *testing.B, engine string) (*Engine, *sqlx.Executor, string) {
+	b.Helper()
+	e, err := Open(b.TempDir() + "/db")
+	if err != nil {
+		b.Fatal(err)
+	}
+	ex := sqlx.NewExecutor(e)
+	tn := "bt"
+	if _, err := ex.Execute(mustParse(b, "CREATE TABLE "+tn+" (id int64 primary key, v string, g int64) ENGINE="+engine)[0]); err != nil {
+		b.Fatal(err)
+	}
+	e.UpdateBatch(func() error {
+		for i := int64(0); i < 1000000; i++ {
+			if err := e.Insert(tn, map[string]sqlx.Value{"id": sqlx.IntValue(i), "v": sqlx.StrValue(fmt.Sprintf("v%d", i)), "g": sqlx.IntValue(i % 100)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return e, ex, tn
 }

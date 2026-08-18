@@ -190,6 +190,11 @@ func (t *cstoreTx) get(key []byte) ([]byte, error) {
 	return v, nil
 }
 
+// colCell point-reads one column cell at an exact pk (nil if absent/deleted).
+func (t *cstoreTx) colCell(table string, colIdx int, pk []byte) ([]byte, error) {
+	return t.get(cstoreColKey(table, colIdx, pk))
+}
+
 func (t *cstoreTx) each(lower, upper []byte, fn func(k, v []byte) error) error {
 	// Fast path: no buffered writes, so the store's byte order is already the
 	// result order and there is nothing to overlay/merge.
@@ -560,18 +565,24 @@ func (v *numVec) setNull(p int) {
 // shape falls back to the generic reader (legacy data).
 func (t *cstoreTx) colDecodeNumeric(table string, colIdx int, typ sqlType, plLower, plUpper []byte) (*numVec, error) {
 	v := &numVec{typ: typ}
+	n := 0
+	if c, err := t.countFor(table); err == nil && c > 0 {
+		n = int(c)
+	}
 	if typ == tFloat {
-		v.floats = make([]float64, 0, 4096)
+		v.floats = make([]float64, 0, n)
 		err := t.colEachRangeNoCopy(table, colIdx, plLower, plUpper, func(_, cell []byte) error {
 			_, f, null, ok := decodeNumericCell(cell, tFloat)
 			if !ok {
 				val := makeReader(cell).Variant()
 				if val.null {
+					v.floats = append(v.floats, 0)
 					v.setNull(v.count)
 				} else {
 					v.floats = append(v.floats, val.f)
 				}
 			} else if null {
+				v.floats = append(v.floats, 0)
 				v.setNull(v.count)
 			} else {
 				v.floats = append(v.floats, f)
@@ -581,17 +592,19 @@ func (t *cstoreTx) colDecodeNumeric(table string, colIdx int, typ sqlType, plLow
 		})
 		return v, err
 	}
-	v.ints = make([]int64, 0, 4096)
+	v.ints = make([]int64, 0, n)
 	err := t.colEachRangeNoCopy(table, colIdx, plLower, plUpper, func(_, cell []byte) error {
 		i, _, null, ok := decodeNumericCell(cell, typ)
 		if !ok {
 			val := makeReader(cell).Variant()
 			if val.null {
+				v.ints = append(v.ints, 0)
 				v.setNull(v.count)
 			} else {
 				v.ints = append(v.ints, val.i)
 			}
 		} else if null {
+			v.ints = append(v.ints, 0)
 			v.setNull(v.count)
 		} else {
 			v.ints = append(v.ints, i)

@@ -300,13 +300,13 @@ func (p *Parser) parseCreate() (Statement, error) {
 			return nil, fmt.Errorf("expected = after ENGINE at pos %d", p.peek().pos)
 		}
 		if p.peek().kind != tokIdent {
-			return nil, fmt.Errorf("expected engine name (TABLE|KV|CSTORE) at pos %d", p.peek().pos)
+			return nil, fmt.Errorf("expected engine name (TABLE|KV|CSTORE|CSTORE2) at pos %d", p.peek().pos)
 		}
 		stmt.Engine = p.identLower()
 		switch stmt.Engine {
-		case "table", "kv", "cstore":
+		case "table", "kv", "cstore", "cstore2":
 		default:
-			return nil, fmt.Errorf("unknown ENGINE %q (want TABLE, KV or CSTORE)", stmt.Engine)
+			return nil, fmt.Errorf("unknown ENGINE %q (want TABLE, KV, CSTORE or CSTORE2)", stmt.Engine)
 		}
 	}
 	// optional: RETENTION = '<duration>' — auto-delete rows older than the window

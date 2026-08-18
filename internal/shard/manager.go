@@ -511,37 +511,26 @@ func contains(xs []string, v string) bool {
 	return false
 }
 
-// scanShard reads all rows from one shard (local read preferred).
+// scanShard reads all rows from one shard through its leader.
 func (m *Manager) scanShard(spec *ShardSpec, sql string) ([]sqlx.Row, error) {
-	if m.hosts(spec) {
-		sh := m.localShard(spec.ID)
-		if sh == nil {
-			return nil, fmt.Errorf("shard %s not mounted locally", spec.ID)
-		}
-		r, err := sh.node.Execute(sql)
-		if err != nil {
-			return nil, err
-		}
-		return r.Rows, nil
-	}
-	addr := m.livePlacementAddr(spec)
-	if addr == "" {
-		return nil, fmt.Errorf("shard %s has no live placement", spec.ID)
-	}
-	var resp *proto.Response
-	err := m.pool.Do(addr, func(c *proto.Client) error {
-		r, err := c.Execute(fmt.Sprintf("ADMIN SCAN-SHARD %s %s %s", spec.Table, spec.ID, sql))
-		if err != nil {
-			return err
-		}
-		resp = r
-		return nil
-	})
+	return m.shardReadRows(spec, sql, nil)
+}
+
+// shardReadRows routes a shard-local SELECT through the shard leader so reads
+// always observe writes the client already acked: a non-leader replica may lag
+// the committed raft log and must not serve stale rows. types, when non-nil,
+// carries the expected column types for partial-aggregate result sets whose
+// columns do not match the table schema.
+func (m *Manager) shardReadRows(spec *ShardSpec, sql string, types []sqlx.Type) ([]sqlx.Row, error) {
+	resp, err := m.execShardSQL(spec, sql)
 	if err != nil {
 		return nil, err
 	}
 	if !resp.OK {
 		return nil, errors.New(resp.Error)
+	}
+	if types != nil {
+		return rowsFromPayloadTyped(resp.Result, types), nil
 	}
 	ts := m.table(spec.Table)
 	if ts == nil {
@@ -551,41 +540,10 @@ func (m *Manager) scanShard(spec *ShardSpec, sql string) ([]sqlx.Row, error) {
 }
 
 // scanShardTyped pushes a shard-local SELECT whose result columns do NOT match
-// the table schema (partial aggregates / grouped partials). Locally hosted
-// shards return typed rows directly; remote shards' rows, which arrive as
-// strings, are reconstructed with the plan's expected column types.
+// the table schema (partial aggregates / grouped partials). Rows arrive as
+// strings over the wire and are reconstructed with the plan's expected types.
 func (m *Manager) scanShardTyped(spec *ShardSpec, sql string, types []sqlx.Type) ([]sqlx.Row, error) {
-	if m.hosts(spec) {
-		sh := m.localShard(spec.ID)
-		if sh == nil {
-			return nil, fmt.Errorf("shard %s not mounted locally", spec.ID)
-		}
-		r, err := sh.node.Execute(sql)
-		if err != nil {
-			return nil, err
-		}
-		return r.Rows, nil
-	}
-	addr := m.livePlacementAddr(spec)
-	if addr == "" {
-		return nil, fmt.Errorf("shard %s has no live placement", spec.ID)
-	}
-	var resp *proto.Response
-	err := m.pool.Do(addr, func(c *proto.Client) error {
-		r, err := c.Execute(fmt.Sprintf("ADMIN SCAN-SHARD %s %s %s", spec.Table, spec.ID, sql))
-		if err != nil {
-			return err
-		}
-		resp = r
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if !resp.OK {
-		return nil, errors.New(resp.Error)
-	}
-	return rowsFromPayloadTyped(resp.Result, types), nil
+	return m.shardReadRows(spec, sql, types)
 }
 
 // scanShardProjected reads only the given columns from one shard so CSTORE
@@ -599,37 +557,11 @@ func (m *Manager) scanShardProjected(spec *ShardSpec, cols []string, tailSQL str
 		return nil, fmt.Errorf("table %q not found", spec.Table)
 	}
 	stmt := "SELECT " + strings.Join(cols, ", ") + " FROM " + spec.Table + tailSQL
-	if m.hosts(spec) {
-		sh := m.localShard(spec.ID)
-		if sh == nil {
-			return nil, fmt.Errorf("shard %s not mounted locally", spec.ID)
-		}
-		r, err := sh.node.Execute(stmt)
-		if err != nil {
-			return nil, err
-		}
-		return expandProjected(cols, ts.Schema, r.Rows), nil
-	}
-	addr := m.livePlacementAddr(spec)
-	if addr == "" {
-		return nil, fmt.Errorf("shard %s has no live placement", spec.ID)
-	}
-	var resp *proto.Response
-	err := m.pool.Do(addr, func(c *proto.Client) error {
-		r, err := c.Execute(fmt.Sprintf("ADMIN EXEC-SHARD %s %s %s", spec.Table, spec.ID, stmt))
-		if err != nil {
-			return err
-		}
-		resp = r
-		return nil
-	})
+	rows, err := m.shardReadRows(spec, stmt, nil)
 	if err != nil {
 		return nil, err
 	}
-	if !resp.OK {
-		return nil, errors.New(resp.Error)
-	}
-	return expandProjected(cols, ts.Schema, rowsFromPayload(resp.Result, ts.Schema)), nil
+	return expandProjected(cols, ts.Schema, rows), nil
 }
 
 // expandProjected reorders/pads projected (narrow) rows back to full schema

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash"
 	"hash/maphash"
+	"math"
 	"strings"
 
 	sqlx "ydbgo/internal/sql"
@@ -42,6 +43,19 @@ func PKRangeBytes(r *sqlx.PKRange) (lower, upper []byte) {
 	return lower, upper
 }
 
+// pointRangeKey reports whether [plLower, plUpper) is a single-key range and
+// returns the key: an equality PK constraint encodes as lower = key and upper
+// = key + 0xff guard byte (see pkBoundBytes).
+func pointRangeKey(plLower, plUpper []byte) ([]byte, bool) {
+	if len(plLower) == 0 || len(plUpper) != len(plLower)+1 {
+		return nil, false
+	}
+	if plUpper[len(plUpper)-1] != 0xff || !bytes.Equal(plUpper[:len(plLower)], plLower) {
+		return nil, false
+	}
+	return plLower, true
+}
+
 // ScanColumns implements sqlx.ColumnEngine for CSTORE tables: materializes
 // only the requested columns by reading one contiguous range per column. Rows
 // come back full-width in schema order with unrequested columns as Null.
@@ -52,7 +66,7 @@ func (e *Engine) ScanColumns(table string, colIdx []int, r *sqlx.PKRange) ([]sql
 	if err != nil {
 		return nil, err
 	}
-	if t.engine != "CSTORE" {
+	if !isColumnarEngine(t.engine) {
 		return nil, errors.New("table " + table + " is not a CSTORE table")
 	}
 	need := make([]bool, len(t.cols))
@@ -63,8 +77,41 @@ func (e *Engine) ScanColumns(table string, colIdx []int, r *sqlx.PKRange) ([]sql
 	}
 	plLower, plUpper := PKRangeBytes(r)
 	var rows []sqlx.Row
+	// Point-PK fast path: a single-row PK range (WHERE pk = literal) touches at
+	// most one row, so read the requested columns directly instead of scanning
+	// the whole column (ClickHouse: primary-index point lookup).
+	if pk, ok := pointRangeKey(plLower, plUpper); ok {
+		err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
+			ct, ok := tx.(columnarTx)
+			if !ok {
+				return errors.New("table " + table + " is not backed by the CSTORE store")
+			}
+			row := make(sqlx.Row, len(t.cols))
+			for i := range t.cols {
+				row[i] = sqlx.NullValue
+			}
+			for i := range t.cols {
+				if !need[i] {
+					continue
+				}
+				cell, err := ct.colCell(table, i, pk)
+				if err != nil {
+					return err
+				}
+				if len(cell) > 0 {
+					row[i] = toSQLValue(makeReader(cell).Variant())
+				}
+			}
+			rows = append(rows, row)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return rows, nil
+	}
 	err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-		ct, ok := tx.(*cstoreTx)
+		ct, ok := tx.(columnarTx)
 		if !ok {
 			return errors.New("table " + table + " is not backed by the CSTORE store")
 		}
@@ -124,7 +171,7 @@ func (e *Engine) ColumnCount(table string, r *sqlx.PKRange) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if t.engine != "CSTORE" {
+	if !isColumnarEngine(t.engine) {
 		return 0, errors.New("table " + table + " is not a CSTORE table")
 	}
 	if r == nil {
@@ -132,7 +179,7 @@ func (e *Engine) ColumnCount(table string, r *sqlx.PKRange) (int64, error) {
 		// scanning row markers.
 		var n int64
 		err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-			ct, ok := tx.(*cstoreTx)
+			ct, ok := tx.(columnarTx)
 			if !ok {
 				return errors.New("table " + table + " is not backed by the CSTORE store")
 			}
@@ -147,7 +194,7 @@ func (e *Engine) ColumnCount(table string, r *sqlx.PKRange) (int64, error) {
 	plLower, plUpper := PKRangeBytes(r)
 	var n int64
 	err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-		ct, ok := tx.(*cstoreTx)
+		ct, ok := tx.(columnarTx)
 		if !ok {
 			return errors.New("table " + table + " is not backed by the CSTORE store")
 		}
@@ -179,7 +226,7 @@ func (e *Engine) ColumnAggregates(table string, colIdx int, aggs []string, r *sq
 	if err != nil {
 		return nil, err
 	}
-	if t.engine != "CSTORE" {
+	if !isColumnarEngine(t.engine) {
 		return nil, errors.New("table " + table + " is not a CSTORE table")
 	}
 	if colIdx < 0 || colIdx >= len(t.cols) {
@@ -213,7 +260,7 @@ func (e *Engine) ColumnAggregates(table string, colIdx int, aggs []string, r *sq
 	)
 	ct := t.cols[colIdx].typ
 	err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-		ct2, ok := tx.(*cstoreTx)
+		ct2, ok := tx.(columnarTx)
 		if !ok {
 			return errors.New("table " + table + " is not backed by the CSTORE store")
 		}
@@ -455,7 +502,7 @@ func (e *Engine) ColumnCountFiltered(table string, pred *sqlx.ColumnFilter, r *s
 	if err != nil {
 		return 0, err
 	}
-	if t.engine != "CSTORE" {
+	if !isColumnarEngine(t.engine) {
 		return 0, errors.New("table " + table + " is not a CSTORE table")
 	}
 	if pred.Col < 0 || pred.Col >= len(t.cols) {
@@ -471,8 +518,35 @@ func (e *Engine) ColumnCountFiltered(table string, pred *sqlx.ColumnFilter, r *s
 	} else if matched {
 		return n, nil
 	}
+	// Point-PK fast path: a single-row PK range (WHERE pk = literal) touches at
+	// most one row, so resolve the predicate column cell directly instead of
+	// scanning the whole column (ClickHouse: primary-index point lookup).
+	if pk, ok := pointRangeKey(plLower, plUpper); ok {
+		err := e.readFrom(e.store(t.engine), func(tx storeTx) error {
+			ct, ok := tx.(columnarTx)
+			if !ok {
+				return errors.New("table " + table + " is not backed by the CSTORE store")
+			}
+			cell, err := ct.colCell(table, pred.Col, pk)
+			if err != nil {
+				return err
+			}
+			if len(cell) == 0 {
+				return nil
+			}
+			m, err := matchesFilter(makeReader(cell).Variant(), pred)
+			if err != nil {
+				return err
+			}
+			if m {
+				n++
+			}
+			return nil
+		})
+		return n, err
+	}
 	err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-		ct, ok := tx.(*cstoreTx)
+		ct, ok := tx.(columnarTx)
 		if !ok {
 			return errors.New("table " + table + " is not backed by the CSTORE store")
 		}
@@ -546,7 +620,7 @@ func (e *Engine) ColumnAggregatesFiltered(table string, colIdx int, aggs []strin
 	if err != nil {
 		return nil, err
 	}
-	if t.engine != "CSTORE" {
+	if !isColumnarEngine(t.engine) {
 		return nil, errors.New("table " + table + " is not a CSTORE table")
 	}
 	if colIdx < 0 || colIdx >= len(t.cols) {
@@ -563,12 +637,12 @@ func (e *Engine) ColumnAggregatesFiltered(table string, colIdx int, aggs []strin
 	} else if matched {
 		// Point-read the aggregate column at each matching pk.
 		err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-			ct, ok := tx.(*cstoreTx)
+			ct, ok := tx.(columnarTx)
 			if !ok {
 				return errors.New("table " + table + " is not backed by the CSTORE store")
 			}
 			for _, pk := range pks {
-				cell, err := ct.get(cstoreColKey(table, colIdx, pk))
+				cell, err := ct.colCell(table, colIdx, pk)
 				if err != nil {
 					return err
 				}
@@ -587,7 +661,7 @@ func (e *Engine) ColumnAggregatesFiltered(table string, colIdx int, aggs []strin
 		return acc.result(aggs), nil
 	}
 	err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-		ct, ok := tx.(*cstoreTx)
+		ct, ok := tx.(columnarTx)
 		if !ok {
 			return errors.New("table " + table + " is not backed by the CSTORE store")
 		}
@@ -685,7 +759,7 @@ func (e *Engine) ScanColumnsFiltered(table string, colIdx []int, pred *sqlx.Colu
 	if err != nil {
 		return nil, err
 	}
-	if t.engine != "CSTORE" {
+	if !isColumnarEngine(t.engine) {
 		return nil, errors.New("table " + table + " is not a CSTORE table")
 	}
 	need := make([]bool, len(t.cols))
@@ -696,6 +770,53 @@ func (e *Engine) ScanColumnsFiltered(table string, colIdx []int, pred *sqlx.Colu
 	}
 	plLower, plUpper := PKRangeBytes(r)
 	var rows []sqlx.Row
+	// Point-PK fast path: a single-row PK range touches at most one row, so
+	// resolve the predicate and the requested columns directly instead of
+	// scanning the whole column (ClickHouse: primary-index point lookup).
+	if pk, ok := pointRangeKey(plLower, plUpper); ok {
+		err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
+			ct, ok := tx.(columnarTx)
+			if !ok {
+				return errors.New("table " + table + " is not backed by the CSTORE store")
+			}
+			cell, err := ct.colCell(table, pred.Col, pk)
+			if err != nil {
+				return err
+			}
+			if len(cell) == 0 {
+				return nil
+			}
+			m, err := matchesFilter(makeReader(cell).Variant(), pred)
+			if err != nil {
+				return err
+			}
+			if !m {
+				return nil
+			}
+			row := make(sqlx.Row, len(t.cols))
+			for i := range t.cols {
+				row[i] = sqlx.NullValue
+			}
+			for i := range t.cols {
+				if !need[i] {
+					continue
+				}
+				cell, err := ct.colCell(table, i, pk)
+				if err != nil {
+					return err
+				}
+				if len(cell) > 0 {
+					row[i] = toSQLValue(makeReader(cell).Variant())
+				}
+			}
+			rows = append(rows, row)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return rows, nil
+	}
 	var pks [][]byte
 	if matched, err := e.indexMatchRange(t, pred, plLower, plUpper, func(pk []byte) error {
 		pks = append(pks, append([]byte(nil), pk...))
@@ -705,7 +826,7 @@ func (e *Engine) ScanColumnsFiltered(table string, colIdx []int, pred *sqlx.Colu
 	} else if matched {
 		// Point-read the requested columns at each matching pk.
 		err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-			ct, ok := tx.(*cstoreTx)
+			ct, ok := tx.(columnarTx)
 			if !ok {
 				return errors.New("table " + table + " is not backed by the CSTORE store")
 			}
@@ -718,7 +839,7 @@ func (e *Engine) ScanColumnsFiltered(table string, colIdx []int, pred *sqlx.Colu
 					if !need[i] {
 						continue
 					}
-					cell, err := ct.get(cstoreColKey(table, i, pk))
+					cell, err := ct.colCell(table, i, pk)
 					if err != nil {
 						return err
 					}
@@ -736,7 +857,7 @@ func (e *Engine) ScanColumnsFiltered(table string, colIdx []int, pred *sqlx.Colu
 		return rows, nil
 	}
 	err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-		ct, ok := tx.(*cstoreTx)
+		ct, ok := tx.(columnarTx)
 		if !ok {
 			return errors.New("table " + table + " is not backed by the CSTORE store")
 		}
@@ -1002,7 +1123,7 @@ func (e *Engine) ColumnGroupedAggregates(table string, groupCol int, gas []sqlx.
 	if err != nil {
 		return nil, err
 	}
-	if t.engine != "CSTORE" {
+	if !isColumnarEngine(t.engine) {
 		return nil, errors.New("table " + table + " is not a CSTORE table")
 	}
 	if groupCol < 0 || groupCol >= len(t.cols) {
@@ -1011,16 +1132,18 @@ func (e *Engine) ColumnGroupedAggregates(table string, groupCol int, gas []sqlx.
 	plLower, plUpper := PKRangeBytes(r)
 	var rows []sqlx.Row
 	err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-		ct, ok := tx.(*cstoreTx)
+		ct, ok := tx.(columnarTx)
 		if !ok {
 			return errors.New("table " + table + " is not backed by the CSTORE store")
 		}
 		type grp struct {
-			raw  []byte // raw cell bytes of the group value (collision check)
-			gval sqlx.Value
-			accs []*colAccum
+			raw    []byte // raw cell bytes of the group value (collision check)
+			gval   sqlx.Value
+			accs   []*colAccum
+			isNull bool // numeric group key was NULL
 		}
 		idx := map[uint64]*grp{}
+		idxN := map[uint64]*grp{}
 		var order []*grp
 		var hh hash.Hash64 = new(maphash.Hash)
 		// Group gas entries by their referenced column so each column is
@@ -1053,8 +1176,86 @@ func (e *Engine) ColumnGroupedAggregates(table string, groupCol int, gas []sqlx.
 		// Pass 1: scan the group column. Each row's group is resolved once and
 		// remembered; aggregate columns then accumulate directly in row order.
 		var groups []*grp
+		if n, err := ct.countFor(table); err == nil && n > 0 {
+			groups = make([]*grp, 0, int(n))
+		}
 		gi := groupCol
-		if err := ct.colEachRangeNoCopy(table, gi, plLower, plUpper, func(_, cell []byte) error {
+		gt := t.cols[gi].typ
+		// Numeric group keys use the dense column decode: the group value is an
+		// int64/float64 keyed by its raw bits, so the group column costs one
+		// typed-array scan with zero per-row cell allocation (ClickHouse
+		// "GROUP BY Int64" path). String keys still hash raw cell bytes.
+		if gt == tInt || gt == tFloat || gt == tTimestamp {
+			v, err := ct.colDecodeNumeric(table, gi, gt, plLower, plUpper)
+			if err != nil {
+				return err
+			}
+			if gt == tFloat {
+				for p := 0; p < v.count; p++ {
+					key, isNull := uint64(0), true
+					if !v.nullAt(p) {
+						key = math.Float64bits(v.floats[p])
+						isNull = false
+					}
+					g := idxN[key]
+					if g != nil && (isNull != g.isNull || !isNull && math.Float64bits(g.gval.Flt) != key) {
+						g = nil
+						for _, cand := range order {
+							if cand.isNull == isNull && (isNull || math.Float64bits(cand.gval.Flt) == key) {
+								g = cand
+								break
+							}
+						}
+					}
+					if g == nil {
+						g = &grp{isNull: isNull, accs: make([]*colAccum, len(gas))}
+						if isNull {
+							g.gval = sqlx.NullValue
+						} else {
+							g.gval = sqlx.FloatValue(v.floats[p])
+						}
+						for k, ga := range gas {
+							g.accs[k] = newColAccum(ga.Aggs)
+						}
+						idxN[key] = g
+						order = append(order, g)
+					}
+					groups = append(groups, g)
+				}
+			} else {
+				for p := 0; p < v.count; p++ {
+					key, isNull := uint64(0), true
+					if !v.nullAt(p) {
+						key = uint64(v.ints[p])
+						isNull = false
+					}
+					g := idxN[key]
+					if g != nil && (isNull != g.isNull || !isNull && g.gval.Int != v.ints[p]) {
+						g = nil
+						for _, cand := range order {
+							if cand.isNull == isNull && (isNull || cand.gval.Int == v.ints[p]) {
+								g = cand
+								break
+							}
+						}
+					}
+					if g == nil {
+						g = &grp{isNull: isNull, accs: make([]*colAccum, len(gas))}
+						if isNull {
+							g.gval = sqlx.NullValue
+						} else {
+							g.gval = sqlx.IntValue(v.ints[p])
+						}
+						for k, ga := range gas {
+							g.accs[k] = newColAccum(ga.Aggs)
+						}
+						idxN[key] = g
+						order = append(order, g)
+					}
+					groups = append(groups, g)
+				}
+			}
+		} else if err := ct.colEachRangeNoCopy(table, gi, plLower, plUpper, func(_, cell []byte) error {
 			hh.Reset()
 			hh.Write(cell)
 			h := hh.Sum64()
@@ -1170,7 +1371,7 @@ func (e *Engine) ScanTopN(table string, colIdx []int, r *sqlx.PKRange, desc bool
 	if err != nil {
 		return nil, err
 	}
-	if t.engine != "CSTORE" {
+	if !isColumnarEngine(t.engine) {
 		return nil, errors.New("table " + table + " is not a CSTORE table")
 	}
 	if limit < 0 {
@@ -1186,7 +1387,7 @@ func (e *Engine) ScanTopN(table string, colIdx []int, r *sqlx.PKRange, desc bool
 	var pks [][]byte
 	var rows []sqlx.Row
 	err = e.readFrom(e.store(t.engine), func(tx storeTx) error {
-		ct, ok := tx.(*cstoreTx)
+		ct, ok := tx.(columnarTx)
 		if !ok {
 			return errors.New("table " + table + " is not backed by the CSTORE store")
 		}
@@ -1215,7 +1416,7 @@ func (e *Engine) ScanTopN(table string, colIdx []int, r *sqlx.PKRange, desc bool
 				if !need[i] {
 					continue
 				}
-				cell, err := ct.get(cstoreColKey(table, i, pk))
+				cell, err := ct.colCell(table, i, pk)
 				if err != nil {
 					return err
 				}

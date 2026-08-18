@@ -215,9 +215,18 @@ func engineOf(e string) string {
 		return "KV"
 	case "cstore":
 		return "CSTORE"
+	case "cstore2":
+		return "CSTORE2"
 	default:
 		return "TABLE"
 	}
+}
+
+// IsColumnarEngine reports whether a normalized engine name is a columnar
+// storage engine (CSTORE or CSTORE2), which unlocks columnar scans, projection
+// and aggregate pushdown.
+func IsColumnarEngine(engine string) bool {
+	return engine == "CSTORE" || engine == "CSTORE2"
 }
 
 func (ex *Executor) execCreateTable(s *CreateTableStmt) (*Result, error) {
@@ -396,7 +405,7 @@ func (ex *Executor) execDelete(s *DeleteStmt) (*Result, error) {
 	// CSTORE retention: a WHERE that is exactly a range over PK columns is a
 	// columnar range delete (markers + cells in one pass), instead of a full
 	// scan with per-row deletes.
-	if schema.Engine == "CSTORE" {
+	if IsColumnarEngine(schema.Engine) {
 		if rng, exact := PKRangeFromWhere(schema, s.Where); exact && rng != nil && (rng.Lower != nil || rng.Upper != nil) {
 			affected, err := ex.Eng.DeleteRange(s.Table, rng)
 			if err != nil {

@@ -59,6 +59,29 @@ func (r *reader) Str() string {
 	r.pos += n
 	return s
 }
+
+// Bytes reads a length-prefixed raw byte slice (Str without the string copy).
+func (r *reader) Bytes() []byte {
+	n := int(r.Var())
+	if r.err != nil || r.pos+n > len(r.buf) {
+		r.err = errors.New("reader: bytes out of range")
+		return nil
+	}
+	b := r.buf[r.pos : r.pos+n]
+	r.pos += n
+	return b
+}
+
+// Take returns the next n raw bytes without a length prefix.
+func (r *reader) Take(n int) []byte {
+	if r.err != nil || r.pos+n > len(r.buf) {
+		r.err = errors.New("reader: take out of range")
+		return nil
+	}
+	b := r.buf[r.pos : r.pos+n]
+	r.pos += n
+	return b
+}
 func (r *reader) Variant() sqlValue {
 	v := sqlValue{typ: sqlType(r.Byte())}
 	v.null = r.Bool()

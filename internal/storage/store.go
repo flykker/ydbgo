@@ -54,6 +54,8 @@ func newStoreFor(dir, engine string) (store, error) {
 		return openKV(dir)
 	case "CSTORE":
 		return openCStore(dir)
+	case "CSTORE2":
+		return openMpart(dir)
 	}
 	return nil, &unknownEngineError{engine: engine}
 }

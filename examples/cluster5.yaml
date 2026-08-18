@@ -1,0 +1,13 @@
+# ydbgo 5-node cluster (used by the CSTORE vs CSTORE2 A/B benchmark).
+# Start with:
+#   ydbgo serve -config examples/cluster5.yaml -node-id n1
+#   ydbgo serve -config examples/cluster5.yaml -node-id n2
+#   ... through n5
+# n1 bootstraps the meta group; the others auto-join it.
+config:
+  hosts:
+  - {host: 127.0.0.1, grpc: 2135, raft: 7001, data: ./cluster5-n1, id: n1, bootstrap: true}
+  - {host: 127.0.0.1, grpc: 2136, raft: 7002, data: ./cluster5-n2, id: n2}
+  - {host: 127.0.0.1, grpc: 2137, raft: 7003, data: ./cluster5-n3, id: n3}
+  - {host: 127.0.0.1, grpc: 2138, raft: 7004, data: ./cluster5-n4, id: n4}
+  - {host: 127.0.0.1, grpc: 2139, raft: 7005, data: ./cluster5-n5, id: n5}

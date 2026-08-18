@@ -42,10 +42,12 @@
 - [x] `internal/kv` — фундамент: байтовые ключи, ревизии, range/prefix, watch/CAS/lease
 - [x] Запуск из YDB-style YAML-конфига (`-config cluster.yaml`): топология кластера в одном файле, узел выбирается по `-node-id`, join выводится из файла, приоритет «явный флаг > конфиг > дефолт» (`internal/config`, `scripts/qa-config.sh`)
 - [x] Бинарные ops в raft-entry (вместо `strings.Join` SQL-текста) — `internal/sql/bincodec.go`
-- [x] `ENGINE=` в парсере/AST: `CREATE TABLE ... ENGINE=TABLE|KV|CSTORE`
+- [x] `ENGINE=` в парсере/AST: `CREATE TABLE ... ENGINE=TABLE|KV|CSTORE|CSTORE2`
 - [x] Фабрика хранилища по движку (`newStoreFor`) + `internal/kv` в качестве бэкенда для `ENGINE=KV`
 - [x] Колоночное хранилище `CSTORE` (OLAP) поверх MVCC
 - [x] OLAP-оптимизации: проекция по колонкам в `SELECT` (в т.ч. через шарды) + pushdown `COUNT/SUM/MIN/MAX/AVG` в колоночный скан + бенчмарк `CSTORE` vs `TABLE`
+- [x] **Нативный колоночный бэкенд `CSTORE2`** (mpart): immutable LZ4-парты, dense fixed-width колонки, bloom на PK парта, разреженный индекс гранул (`idx.bin`) — точечные/`ORDER BY DESC LIMIT` читают только нужные гранулы, гранульный кэш на парте
+- [x] **Пред-аллокация векторного скорачивания**: `countFor`-пред-аллокация `numVec` в `colDecodeNumeric` (обе стороны), пред-аллокация групп — alloc/op 134MB→**24MB**, локальный `GROUP BY` 92ms→**48ms**
 - [x] **KV SQL-поверхность** для `ENGINE=KV`: `KV PUT/GET/DELETE/SCAN` через raft и шарды
 - [x] OLAP-оптимизации: агрегаты с `GROUP BY` в колоночном исполнении, колоночное покрытие `WHERE` (PK-range pruning + пропуск шардов)
 - [x] Pushdown цельно-табличных агрегатов на шарды (partial-merge без пересылки строк) + retention/compaction для `CSTORE` (range-`DELETE` по PK + физический `kv.Compact`)
@@ -229,7 +231,9 @@ cmd/ydbgo            — один бинарник: serve / run / repl / bench /
 internal/kv          — байтовый MVCC KV (ревизии, range/prefix, watch/CAS/lease) — фундамент для ENGINE=KV|CSTORE
 internal/sql         — лексер, парсер, AST, исполнитель, агрегаты
 internal/storage     — Engine поверх pluggable store (pebble по умолчанию),
-                       PK-кодирование, снапшоты (Marshal/Replace), батч-транзакции
+                       PK-кодирование, снапшоты (Marshal/Replace), батч-транзакции;
+                       нативный колоночный бэкенд CSTORE2 (mpart.go, mpart_col.go)
+                       с dense-колонками, bloom-фильтрами и разреженным индексом гранул
 internal/raftsvc     — generic Raft-группа, Node + Group + FSM, group-commit
 internal/shard       — Manager, каталог (meta), роутинг, авто-сплит, recovery, метрики
 internal/server      — gRPC-сервер, клиент, CLI-обвязка
@@ -256,14 +260,18 @@ Raft-entries переносят **бинарные ops** (`sqlx.EncodeStatements
 
 ### Движок таблиц: `ENGINE=`
 
-`CREATE TABLE ... ENGINE=TABLE|KV|CSTORE` выбирает бэкенд таблицы. `TABLE`
+`CREATE TABLE ... ENGINE=TABLE|KV|CSTORE|CSTORE2` выбирает бэкенд таблицы. `TABLE`
 (по умолчанию) — обычный row-store на Pebble; `KV` — MVCC byte-store
 (`internal/kv`, ревизии/range/prefix), подключённый через адаптер
 `internal/storage/kvstore.go`; `CSTORE` — колоночный (column-major) бэкенд
 `internal/storage/cstore.go` поверх того же `internal/kv`: каждая колонка —
-непрерывный диапазон, строки пересобираются из своих ячеек. Схема таблиц лежит
-в default-сторе, строки — в сторе своего движка; `MarshalState`/`ReplaceState`
-(raft-снапшоты) охватывают все движки.
+непрерывный диапазон, строки пересобираются из своих ячеек; `CSTORE2` — нативный
+колоночный бэкенд `internal/storage/mpart.go` на собственных файлах (`meta.bin`
++ по файлу на колонку + `pk.bin`/`del.bin`/`idx.bin`): части immutable,
+LZ4-сжатые колонки в компактном fixed-width (dense) формате для чисел, bloom-
+фильтр на PK парта и разреженный индекс гранул (`idx.bin`, ~64k строк на
+гранулу). Схема таблиц лежит в default-сторе, строки — в сторе своего движка;
+`MarshalState`/`ReplaceState` (raft-снапшоты) охватывают все движки.
 
 ### OLAP-оптимизации для `CSTORE`
 
@@ -306,6 +314,16 @@ Raft-entries переносят **бинарные ops** (`sqlx.EncodeStatements
   шарды); в `CSTORE` шаблон `'префикс%'` по строковому PK превращается в
   префиксный PK-range (`[prefix, successor(prefix))`), что даёт pruning по
   колонкам и пропуск шардов так же, как диапазонное условие.
+- **Разреженный индекс гранул (`CSTORE2`)** — парт хранится блоками по ~64k
+  строк, каждый блок LZ4-сжат независимо; `idx.bin` держит PK-максимум каждой
+  гранулы и смещения/длины её блоков в `pk.bin`/`col_N.bin`/`del.bin`. Точечный
+  `WHERE pk = ...` и `ORDER BY pk DESC LIMIT n` декодируют только гранулу,
+  способную держать ключ (а `ORDER BY DESC` — хвостовые гранулы с конца, как
+  обратный скан sparse-индекса ClickHouse). Декодированные гранулы мемоизируются
+  на парте (парты immutable), так что повторные точки/`UPDATE` не перечитывают
+  блок. Это закрыло разрыв `ORDER BY ... LIMIT`/point после слияния партов в
+  один: в 1M-строковом A/B (5 узлов, RF=3) против ClickHouse 25.3 тёплые
+  `ORDER BY id DESC LIMIT 10` и point-get идут 19–25ms при 22–24ms у CH.
 - **Auto-TTL (retention)** — `CREATE TABLE ... RETENTION = '<window>'` (напр.
   `'7d'` или `'24h'`); фоновый цикл на лидере каждого шарда раз в
   `-ttl-tick` удаляет строки, чей timestamp-PK старше окна (одна timestamp-PK
@@ -523,6 +541,7 @@ UI проверяется не snapshot-тестами, а **реальным б
 | `scripts/reseed-demo.sh` | засеять чистые демо-данные против **работающего** сервера: таблица `logs ENGINE=CSTORE` (300 строк через `ydbgo run`, бинарь — `$YDBGO`, по умолч. `./bin/ydbgo`), пересоздать дашборд «Cluster overview», удалить старые |
 | `scripts/ui-qa.sh` | прогнать все QA-скрипты `internal/ui/web/verify-*.mjs` в заданном порядке (или один — по glob-аргументу, напр. `./scripts/ui-qa.sh 'verify-grid*'`); порядок важен: `verify-metrics` пишет в `logs` и должен идти до `verify-admin` (тот делает SPLIT и оставляет сплит-шард); каждый печатает свою строку `RESULT: OK` |
 | `scripts/qa-config.sh` | поднять двухузловой кластер из YAML-конфига (`serve -config`): bootstrap + join по топологии из файла, оба узла видны через `/api/v1/nodes`, DDL/DML/read сквозь адреса из конфига, явный `-addr` перекрывает конфиг, неизвестный `-node-id` отклоняется; свои порты/временный каталог, чужие процессы не трогает |
+| `scripts/qa-mpart.sh` | A/B 5-узлового кластера RF=3: `ENGINE=CSTORE` vs `ENGINE=CSTORE2` (нативный mpart) на 1M строк (env: `QA_WORKDIR`, `QA_STATEMENTS`, `QA_ROWS`, `QA_CONC`, `QA_KEEP=1`) — колоночные пробы `COUNT/SUM/GROUP BY/ORDER BY DESC LIMIT/point` + footprint; после нагрузки `sleep 2` (CH-parity) для слияния партов |
 | `internal/ui/web/verify-*.mjs` | отдельные проверки браузером (см. таблицу ниже) |
 
 Типовой цикл:
@@ -780,6 +799,38 @@ go run ./cmd/benchcol -ch http://127.0.0.1:8123 -ydb 127.0.0.1:2135 -stmts 960 -
 # 5-узловой CH кластер RF=3 (контейнеры c0..c4, таблицы logs_0..logs_4 +
 # VIEW logs + Distributed logs_dist предсозданы):
 go run ./cmd/benchcol -nodes http://127.0.0.1:8120,http://127.0.0.1:8121,http://127.0.0.1:8122,http://127.0.0.1:8123,http://127.0.0.1:8124 -stmts 960 -rows 200 -clients 8 -reads 100
+```
+
+### 1M-строковый A/B: `CSTORE2` vs ClickHouse
+
+Тот же протокол, но крупнее и на нативном движке: **1 000 000 строк** заливаются
+через `ydbgo bench` в `ENGINE=CSTORE2` на 5-узловой кластер RF=3 (данные на
+`/dev/shm`), после нагрузки кластер ждёт `SYSTEM SYNC REPLICA`-эквивалент
+(2s idle, чтобы фоновая компакция слила парты в один), затем замеряются холодные
+и тёплые колоночные чтения. Эталон: ClickHouse 25.3 single-node на `/dev/shm`
+(те же 1M строк, `MergeTree`), пробы — `./scripts/qa-mpart.sh` и
+`/tmp/qa-ch-1m.log`.
+
+| Запрос | CH cold | ydbgo CSTORE2 cold | CH warm | ydbgo CSTORE2 warm |
+|--------|---------|--------------------|---------|--------------------|
+| `SUM(id)` | 34–37ms | **107–114ms** | 34–37ms | **38–62ms** |
+| `GROUP BY g` | 39–41ms | **131–156ms** | 39–41ms | **59–83ms** |
+| `ORDER BY id DESC LIMIT 10` | 22–23ms | **32–34ms** | 22–23ms | **19–24ms** |
+| point `WHERE id=42` | 23–24ms | **46–50ms** | 23–24ms | **20–25ms** |
+| `COUNT(*)` | 20–24ms | **22–24ms** | 20–24ms | **~22ms** |
+
+Холодные пробы платят декод 1M-строкового парта с диска (как CH после
+загрузки); тёплые — повторные пробы на прогретом кэше парта. После введения
+разреженного индекса гранул + гранульного кэша `ORDER BY ... LIMIT` и point-get
+стали **на паритете или быстрее CH** (19–25ms против 22–24ms), чего не было до
+этого: на одиночном слитом парте они шли 243ms / 129ms, а на 16-партовом —
+223ms / 110ms (cold). `SUM`/`GROUP BY` — в 1.2–2× от CH вместо 6–9× на старте
+(`GROUP BY` был 948ms).
+
+Запуск:
+
+```sh
+QA_WORKDIR=/dev/shm ./scripts/qa-mpart.sh   # ydbgo: 5n RF=3, CSTORE + CSTORE2, 1M строк
 ```
 
 ### План оптимизаций по итогам сравнения
