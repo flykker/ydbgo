@@ -104,20 +104,38 @@ func (t *mpartTx) colRowCountRange(table string, plLower, plUpper []byte) (int64
 // decode): no per-cell varint parsing, no per-cell frame headers. Legacy parts
 // (v1/v2 frames) and the mem/overlay sources fall back to per-cell decode.
 func (t *mpartTx) colDecodeNumeric(table string, colIdx int, typ sqlType, plLower, plUpper []byte) (*numVec, error) {
-	v := &numVec{typ: typ}
+	v := poolNumVec()
+	v.typ = typ
+	// Whole-window decode with no deletions/null/overlay: bulk-fill straight
+	// from the cached dense part values (one append per part) instead of the
+	// per-row callback.
+	if plLower == nil && plUpper == nil && !t.cleared[table] && t.overlay[table] == nil {
+		if fv, ok := t.denseNumericFast(table, colIdx, typ); ok {
+			putNumVec(v)
+			return fv, nil
+		}
+	}
 	// Preallocate to the live row count so the append loop below never
 	// reallocates: Go's ~1.25x growth for large slices would otherwise copy
 	// ~8x the final size in total. countFor is a cheap cached read.
 	if n, err := t.countFor(table); err == nil && n > 0 {
 		if typ == tFloat {
-			v.floats = make([]float64, 0, int(n))
+			if cap(v.floats) < int(n) {
+				v.floats = make([]float64, 0, int(n))
+			}
 		} else {
-			v.ints = make([]int64, 0, int(n))
+			if cap(v.ints) < int(n) {
+				v.ints = make([]int64, 0, int(n))
+			}
 		}
 	} else if typ == tFloat {
-		v.floats = make([]float64, 0, 4096)
+		if cap(v.floats) < 4096 {
+			v.floats = make([]float64, 0, 4096)
+		}
 	} else {
-		v.ints = make([]int64, 0, 4096)
+		if cap(v.ints) < 4096 {
+			v.ints = make([]int64, 0, 4096)
+		}
 	}
 	err := t.walkMergedNumeric(table, colIdx, typ, plLower, plUpper, func(_ []byte, val int64, null bool, del bool) error {
 		if del {
@@ -142,6 +160,97 @@ func (t *mpartTx) colDecodeNumeric(table string, colIdx int, typ sqlType, plLowe
 		return nil
 	})
 	return v, err
+}
+
+// denseNumericFast bulk-fills one whole numeric column from dense part values
+// only: every part's column dense, pairwise-disjoint PK windows, no
+// tombstones, no NULL bits and no overlapping mem tail. Returns (vec, true)
+// when it fully decoded the column. This is the SUM/GROUP hot path after an
+// idle merge (single part): one bulk append per part instead of a per-row
+// callback.
+func (t *mpartTx) denseNumericFast(table string, colIdx int, typ sqlType) (*numVec, bool) {
+	parts, mem := t.committedViewLocked(table)
+	for _, p := range parts {
+		if colIdx >= len(p.colFmts) {
+			return nil, false
+		}
+		if _, dense := colFmtType(p.colFmts[colIdx]); !dense {
+			return nil, false
+		}
+	}
+	sort.Slice(parts, func(i, j int) bool { return bytes.Compare(parts[i].pkMin, parts[j].pkMin) < 0 })
+	for k := 0; k < len(parts)-1; k++ {
+		if bytes.Compare(parts[k].pkMax, parts[k+1].pkMin) >= 0 {
+			return nil, false
+		}
+	}
+	var memRows []*memRow
+	if mem != nil && mapRows(mem) > 0 {
+		mem.ensureCached()
+		memRows = mem.cacheRows
+		if len(memRows) > 0 && len(parts) > 0 && bytes.Compare(memRows[0].pk, parts[len(parts)-1].pkMax) <= 0 {
+			return nil, false
+		}
+	}
+	n := 0
+	if c, err := t.countFor(table); err == nil && c > 0 {
+		n = int(c)
+	}
+	v := poolNumVec()
+	v.typ = typ
+	if typ == tFloat {
+		if cap(v.floats) < n {
+			v.floats = make([]float64, 0, n)
+		}
+	} else {
+		if cap(v.ints) < n {
+			v.ints = make([]int64, 0, n)
+		}
+	}
+	for _, p := range parts {
+		vals, nulls, dense, err := p.loadColDense(colIdx)
+		if err != nil || !dense {
+			return nil, false
+		}
+		for _, w := range nulls {
+			if w != 0 {
+				return nil, false
+			}
+		}
+		dels, err := p.loadDels()
+		if err != nil {
+			return nil, false
+		}
+		for _, d := range dels {
+			if d {
+				return nil, false
+			}
+		}
+		if typ == tFloat {
+			for _, x := range vals {
+				v.floats = append(v.floats, math.Float64frombits(uint64(x)))
+			}
+		} else {
+			v.ints = append(v.ints, vals...)
+		}
+		v.count += len(vals)
+	}
+	for _, r := range memRows {
+		if r.del || colIdx >= len(r.cells) {
+			return nil, false
+		}
+		val, null, ok := numericAtCell(r.cells[colIdx], typ)
+		if !ok || null {
+			return nil, false
+		}
+		if typ == tFloat {
+			v.floats = append(v.floats, math.Float64frombits(uint64(val)))
+		} else {
+			v.ints = append(v.ints, val)
+		}
+		v.count++
+	}
+	return v, true
 }
 
 // walkMergedNumeric streams the table's numeric column values inside

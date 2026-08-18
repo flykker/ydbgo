@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"ydbgo/internal/kv"
 )
@@ -544,6 +545,24 @@ type numVec struct {
 	ints   []int64
 	floats []float64
 	nulls  []uint64 // bit p set => cell p is NULL
+}
+
+// numVecPool recycles the 8-16MB dense column buffers between queries. Large
+// slices are mmap'd and returned via madvise on free (visible in GROUP BY
+// profiles as runtime.madvise/scavenge), so reusing the backing arrays keeps
+// hot GROUP/SUM loops off the allocator. The pool only reuses an instance
+// when a caller puts it back; dropped puts only cost reuse, never correctness.
+var numVecPool = sync.Pool{New: func() any { return &numVec{} }}
+
+func poolNumVec() *numVec {
+	v := numVecPool.Get().(*numVec)
+	v.ints, v.floats, v.nulls = v.ints[:0], v.floats[:0], v.nulls[:0]
+	v.count = 0
+	return v
+}
+
+func putNumVec(v *numVec) {
+	numVecPool.Put(v)
 }
 
 func (v *numVec) nullAt(p int) bool {

@@ -272,6 +272,7 @@ func (e *Engine) ColumnAggregates(table string, colIdx int, aggs []string, r *sq
 			if err != nil {
 				return err
 			}
+			defer putNumVec(v)
 			return aggNumVec(v, flags, &cnt, &sum, &sumInt, &any, &minV, &maxV, &minSet, &maxSet, &avgTotal, &avgN)
 		}
 		return ct2.colEachRange(table, colIdx, plLower, plUpper, func(_, cell []byte) error {
@@ -559,6 +560,7 @@ func (e *Engine) ColumnCountFiltered(table string, pred *sqlx.ColumnFilter, r *s
 			if err != nil {
 				return err
 			}
+			defer putNumVec(v)
 			if v.typ == tFloat {
 				for p := 0; p < v.count; p++ {
 					if v.nullAt(p) {
@@ -674,6 +676,7 @@ func (e *Engine) ColumnAggregatesFiltered(table string, colIdx int, aggs []strin
 				if err != nil {
 					return err
 				}
+				defer putNumVec(v)
 				if v.typ == tFloat {
 					for p := 0; p < v.count; p++ {
 						if v.nullAt(p) {
@@ -921,6 +924,11 @@ func (e *Engine) ScanColumnsFiltered(table string, colIdx []int, pred *sqlx.Colu
 	}
 	return rows, nil
 }
+
+// maxGroupBucket bounds how large a group-key bucket array may grow. Key
+// ranges wider than this fall back to the hash map (e.g. GROUP BY on a dense
+// int64 key). 1<<22 buckets = 4MB of int32s.
+const maxGroupBucket = 1 << 22
 
 // colAccum accumulates one or more aggregate functions over a stream of cells.
 type colAccum struct {
@@ -1175,12 +1183,241 @@ func (e *Engine) ColumnGroupedAggregates(table string, groupCol int, gas []sqlx.
 		}
 		// Pass 1: scan the group column. Each row's group is resolved once and
 		// remembered; aggregate columns then accumulate directly in row order.
+		// The 1M-entry groups array is only needed by the non-fast path (fastAgg
+		// folds aggregates in the same loop), so it is allocated there.
 		var groups []*grp
+		gi := groupCol
+		gt := t.cols[gi].typ
+		// Fast GROUP BY path: numeric group key + only numeric aggregate
+		// columns. The group and every aggregate column are bulk-decoded once,
+		// then one row loop resolves the group and folds all aggregates in
+		// place (no separate pass2, no groups[p] indirection).
+		numericGroup := gt == tInt || gt == tFloat || gt == tTimestamp
+		allAggNumeric := true
+		for _, ca := range colAggs {
+			ctyp := t.cols[ca.col].typ
+			if ctyp != tInt && ctyp != tFloat && ctyp != tTimestamp {
+				allAggNumeric = false
+				break
+			}
+		}
+		fastAgg := numericGroup && allAggNumeric
+		if fastAgg {
+			gv, err := ct.colDecodeNumeric(table, gi, gt, plLower, plUpper)
+			if err != nil {
+				return err
+			}
+			avs := make([]*numVec, len(colAggs))
+			for i, ca := range colAggs {
+				av, err := ct.colDecodeNumeric(table, ca.col, t.cols[ca.col].typ, plLower, plUpper)
+				if err != nil {
+					return err
+				}
+				avs[i] = av
+			}
+			if gt == tFloat {
+				for p := 0; p < gv.count; p++ {
+					key, isNull := uint64(0), true
+					if !gv.nullAt(p) {
+						key = math.Float64bits(gv.floats[p])
+						isNull = false
+					}
+					g := idxN[key]
+					if g != nil && (isNull != g.isNull || !isNull && math.Float64bits(g.gval.Flt) != key) {
+						g = nil
+						for _, cand := range order {
+							if cand.isNull == isNull && (isNull || math.Float64bits(cand.gval.Flt) == key) {
+								g = cand
+								break
+							}
+						}
+					}
+					if g == nil {
+						g = &grp{isNull: isNull, accs: make([]*colAccum, len(gas))}
+						if isNull {
+							g.gval = sqlx.NullValue
+						} else {
+							g.gval = sqlx.FloatValue(gv.floats[p])
+						}
+						for k, ga := range gas {
+							g.accs[k] = newColAccum(ga.Aggs)
+						}
+						idxN[key] = g
+						order = append(order, g)
+					}
+					for _, k := range starK {
+						g.accs[k].cnt++
+					}
+					for ai, ca := range colAggs {
+						av := avs[ai]
+						if av.nullAt(p) {
+							continue
+						}
+						if av.typ == tFloat {
+							for _, k := range ca.k {
+								g.accs[k].addNum(tFloat, 0, av.floats[p])
+							}
+						} else {
+							for _, k := range ca.k {
+								g.accs[k].addNum(av.typ, av.ints[p], 0)
+							}
+						}
+					}
+				}
+			} else {
+				// int/timestamp group key. When the key range is small (the
+				// GROUP BY Int64 path: g = i%100), a bucket array of group
+				// indices replaces the hash map entirely — one direct indexed
+				// load per row instead of a hashed lookup.
+				var nullGrp *grp
+				lo, hi := int64(0), int64(0)
+				firstKey := true
+				for p := 0; p < gv.count; p++ {
+					if gv.nullAt(p) {
+						continue
+					}
+					x := gv.ints[p]
+					if firstKey || x < lo {
+						lo = x
+					}
+					if firstKey || x > hi {
+						hi = x
+					}
+					firstKey = false
+				}
+				if firstKey || uint64(hi)-uint64(lo) < uint64(maxGroupBucket) {
+					bucket := make([]int32, uint64(hi)-uint64(lo)+1)
+					for i := range bucket {
+						bucket[i] = -1
+					}
+					noNulls := make([]bool, len(colAggs))
+					for i, av := range avs {
+						noNulls[i] = len(av.nulls) == 0
+					}
+					for p := 0; p < gv.count; p++ {
+						var g *grp
+						if gv.nullAt(p) {
+							g = nullGrp
+							if g == nil {
+								g = &grp{isNull: true, gval: sqlx.NullValue, accs: make([]*colAccum, len(gas))}
+								for k, ga := range gas {
+									g.accs[k] = newColAccum(ga.Aggs)
+								}
+								nullGrp = g
+								order = append(order, g)
+							}
+						} else {
+							bi := bucket[gv.ints[p]-lo]
+							if bi >= 0 {
+								g = order[bi]
+							} else {
+								g = &grp{isNull: false, gval: sqlx.IntValue(gv.ints[p]), accs: make([]*colAccum, len(gas))}
+								for k, ga := range gas {
+									g.accs[k] = newColAccum(ga.Aggs)
+								}
+								bucket[gv.ints[p]-lo] = int32(len(order))
+								order = append(order, g)
+							}
+						}
+						for _, k := range starK {
+							g.accs[k].cnt++
+						}
+						for ai, ca := range colAggs {
+							av := avs[ai]
+							if !noNulls[ai] && av.nullAt(p) {
+								continue
+							}
+							if av.typ == tFloat {
+								for _, k := range ca.k {
+									g.accs[k].addNum(tFloat, 0, av.floats[p])
+								}
+							} else if len(ca.k) == 1 && g.accs[ca.k[0]].flags == accSum {
+								a := g.accs[ca.k[0]]
+								a.sum += float64(av.ints[p])
+								a.any = true
+							} else {
+								for _, k := range ca.k {
+									g.accs[k].addNum(av.typ, av.ints[p], 0)
+								}
+							}
+						}
+					}
+				} else {
+					noNulls := make([]bool, len(colAggs))
+					for i, av := range avs {
+						noNulls[i] = len(av.nulls) == 0
+					}
+					for p := 0; p < gv.count; p++ {
+						key, isNull := uint64(0), true
+						if !gv.nullAt(p) {
+							key = uint64(gv.ints[p])
+							isNull = false
+						}
+						g := idxN[key]
+						if g != nil && (isNull != g.isNull || !isNull && g.gval.Int != gv.ints[p]) {
+							g = nil
+							for _, cand := range order {
+								if cand.isNull == isNull && (isNull || cand.gval.Int == gv.ints[p]) {
+									g = cand
+									break
+								}
+							}
+						}
+						if g == nil {
+							g = &grp{isNull: isNull, accs: make([]*colAccum, len(gas))}
+							if isNull {
+								g.gval = sqlx.NullValue
+							} else {
+								g.gval = sqlx.IntValue(gv.ints[p])
+							}
+							for k, ga := range gas {
+								g.accs[k] = newColAccum(ga.Aggs)
+							}
+							idxN[key] = g
+							order = append(order, g)
+						}
+						for _, k := range starK {
+							g.accs[k].cnt++
+						}
+						for ai, ca := range colAggs {
+							av := avs[ai]
+							if !noNulls[ai] && av.nullAt(p) {
+								continue
+							}
+							if av.typ == tFloat {
+								for _, k := range ca.k {
+									g.accs[k].addNum(tFloat, 0, av.floats[p])
+								}
+							} else if len(ca.k) == 1 && g.accs[ca.k[0]].flags == accSum {
+								a := g.accs[ca.k[0]]
+								a.sum += float64(av.ints[p])
+								a.any = true
+							} else {
+								for _, k := range ca.k {
+									g.accs[k].addNum(av.typ, av.ints[p], 0)
+								}
+							}
+						}
+					}
+				}
+			}
+			putNumVec(gv)
+			for _, av := range avs {
+				putNumVec(av)
+			}
+			for _, g := range order {
+				row := make(sqlx.Row, 1+len(gas))
+				row[0] = g.gval
+				for k, ga := range gas {
+					row[1+k] = g.accs[k].result(ga.Aggs)[0]
+				}
+				rows = append(rows, row)
+			}
+			return nil
+		}
 		if n, err := ct.countFor(table); err == nil && n > 0 {
 			groups = make([]*grp, 0, int(n))
 		}
-		gi := groupCol
-		gt := t.cols[gi].typ
 		// Numeric group keys use the dense column decode: the group value is an
 		// int64/float64 keyed by its raw bits, so the group column costs one
 		// typed-array scan with zero per-row cell allocation (ClickHouse
@@ -1190,6 +1427,7 @@ func (e *Engine) ColumnGroupedAggregates(table string, groupCol int, gas []sqlx.
 			if err != nil {
 				return err
 			}
+			defer putNumVec(v)
 			if gt == tFloat {
 				for p := 0; p < v.count; p++ {
 					key, isNull := uint64(0), true
@@ -1287,7 +1525,7 @@ func (e *Engine) ColumnGroupedAggregates(table string, groupCol int, gas []sqlx.
 		for _, k := range starK {
 			// COUNT(*) counts every row of the group.
 			for _, g := range groups {
-				g.accs[k].star()
+				g.accs[k].cnt++
 			}
 		}
 		for _, ca := range colAggs {
@@ -1300,6 +1538,7 @@ func (e *Engine) ColumnGroupedAggregates(table string, groupCol int, gas []sqlx.
 				if err != nil {
 					return err
 				}
+				defer putNumVec(v)
 				if v.count != len(groups) {
 					return errors.New("column/pk count mismatch in " + table)
 				}
