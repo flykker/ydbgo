@@ -5,6 +5,8 @@ import (
 	"container/heap"
 	"math"
 	"sort"
+
+	sqlx "ydbgo/internal/sql"
 )
 
 // Columnar read surface shared by the CSTORE (internal/kv column-major) and
@@ -24,6 +26,11 @@ type columnarTx interface {
 	// colDecodeNumeric materializes one numeric column as dense arrays, skipping
 	// the per-cell reader allocation.
 	colDecodeNumeric(table string, colIdx int, typ sqlType, plLower, plUpper []byte) (*numVec, error)
+	// colDecodeNumericFiltered is colDecodeNumeric with zone-map pruning: the
+	// resulting vector may omit rows from granules whose value bounds cannot
+	// match pred, so callers must only use it when they would have dropped
+	// non-matching rows anyway (numeric equality filters over the same column).
+	colDecodeNumericFiltered(table string, colIdx int, typ sqlType, pred *sqlx.ColumnFilter, plLower, plUpper []byte) (*numVec, error)
 	// colRowKeysRange yields the live PKs inside the range in PK order.
 	colRowKeysRange(table string, plLower, plUpper []byte, fn func(pk []byte) error) error
 	// colRowKeysRangeDesc yields the live PKs inside the range in reverse PK
@@ -162,6 +169,136 @@ func (t *mpartTx) colDecodeNumeric(table string, colIdx int, typ sqlType, plLowe
 	return v, err
 }
 
+// colDecodeNumericFiltered decodes one numeric column but skips whole granules
+// whose zone maps cannot satisfy a numeric equality predicate (idx ver 3).
+// NULL rows in surviving granules are still present (matchesFilter drops them),
+// so the resulting vector is a superset of the rows matching pred — safe to
+// feed to the same-column filtered aggregate/count loops that apply
+// matchesFilter themselves.
+func (t *mpartTx) colDecodeNumericFiltered(table string, colIdx int, typ sqlType, pred *sqlx.ColumnFilter, plLower, plUpper []byte) (*numVec, error) {
+	if pred == nil || pred.Op != "=" {
+		return t.colDecodeNumeric(table, colIdx, typ, plLower, plUpper)
+	}
+	if typ != tInt && typ != tFloat && typ != tTimestamp {
+		return t.colDecodeNumeric(table, colIdx, typ, plLower, plUpper)
+	}
+	if plLower != nil || plUpper != nil {
+		// Zone pruning needs per-granule row ranges; a PK-bound window would
+		// require the caller to remap row indices, so fall back to the plain
+		// decode (correctness over speed here).
+		return t.colDecodeNumeric(table, colIdx, typ, plLower, plUpper)
+	}
+	if t.cleared[table] || t.overlay[table] != nil {
+		return t.colDecodeNumeric(table, colIdx, typ, plLower, plUpper)
+	}
+	parts, mem := t.committedViewLocked(table)
+	zoning := true
+	sorted := append([]*mpart(nil), parts...)
+	sort.Slice(sorted, func(i, j int) bool { return bytes.Compare(sorted[i].pkMin, sorted[j].pkMin) < 0 })
+	for k := 0; k < len(sorted)-1; k++ {
+		if bytes.Compare(sorted[k].pkMax, sorted[k+1].pkMin) >= 0 {
+			zoning = false
+			break
+		}
+	}
+	for _, p := range sorted {
+		if colIdx >= len(p.colFmts) || len(p.granules) == 0 || colIdx >= len(p.granules[0].zoneMin) {
+			zoning = false
+			break
+		}
+		if _, dense := colFmtType(p.colFmts[colIdx]); !dense {
+			zoning = false
+			break
+		}
+	}
+	if !zoning {
+		return t.colDecodeNumeric(table, colIdx, typ, plLower, plUpper)
+	}
+	v := poolNumVec()
+	v.typ = typ
+	if n, err := t.countFor(table); err == nil && n > 0 {
+		if typ == tFloat {
+			if cap(v.floats) < int(n) {
+				v.floats = make([]float64, 0, int(n))
+			}
+		} else {
+			if cap(v.ints) < int(n) {
+				v.ints = make([]int64, 0, int(n))
+			}
+		}
+	}
+	for _, p := range sorted {
+		for g := range p.granules {
+			if !p.granuleZoneHits(g, colIdx, pred, typ) {
+				continue
+			}
+			vals, nulls, err := p.loadGranuleDense(g, colIdx)
+			if err != nil {
+				return nil, err
+			}
+			dels, err := p.loadGranuleDels(g)
+			if err != nil {
+				return nil, err
+			}
+			for i, raw := range vals {
+				if dels != nil && dels[i] {
+					continue
+				}
+				if nulls != nil && nulls[i>>6]&(1<<(i&63)) != 0 {
+					if typ == tFloat {
+						v.floats = append(v.floats, 0)
+					} else {
+						v.ints = append(v.ints, 0)
+					}
+					v.setNull(v.count)
+					v.count++
+					continue
+				}
+				if typ == tFloat {
+					v.floats = append(v.floats, math.Float64frombits(uint64(raw)))
+				} else {
+					v.ints = append(v.ints, raw)
+				}
+				v.count++
+			}
+		}
+	}
+	if mem != nil && mapRows(mem) > 0 {
+		// The mem tail is not covered by zones (still in flight); decode it
+		// through the plain walk and append its (already live) rows.
+		mem.ensureCached()
+		rows := mem.cacheRows
+		if len(rows) > 0 {
+			for _, r := range rows {
+				if r.del || colIdx >= len(r.cells) {
+					continue
+				}
+				val, f, null, ok := decodeNumericCell(r.cells[colIdx], typ)
+				if !ok {
+					continue
+				}
+				if typ == tFloat {
+					if null {
+						v.floats = append(v.floats, 0)
+						v.setNull(v.count)
+					} else {
+						v.floats = append(v.floats, f)
+					}
+				} else {
+					if null {
+						v.ints = append(v.ints, 0)
+						v.setNull(v.count)
+					} else {
+						v.ints = append(v.ints, val)
+					}
+				}
+				v.count++
+			}
+		}
+	}
+	return v, nil
+}
+
 // denseNumericFast bulk-fills one whole numeric column from dense part values
 // only: every part's column dense, pairwise-disjoint PK windows, no
 // tombstones, no NULL bits and no overlapping mem tail. Returns (vec, true)
@@ -190,6 +327,43 @@ func (t *mpartTx) denseNumericFast(table string, colIdx int, typ sqlType) (*numV
 		memRows = mem.cacheRows
 		if len(memRows) > 0 && len(parts) > 0 && bytes.Compare(memRows[0].pk, parts[len(parts)-1].pkMax) <= 0 {
 			return nil, false
+		}
+	}
+	// Zero-copy path: a single dense part with no nulls, no tombstones and no
+	// mem tail aliases the part's cached dense arrays directly. The caller
+	// treats the returned numVec as read-only (GROUP/SUM hot path), and
+	// putNumVec skips recycling borrowed vectors so the part cache is never
+	// mutated by a later pool user. This removes the 8MB-per-column copy and
+	// its GC pressure (the dominant cost of a warm GROUP).
+	if len(parts) == 1 && len(memRows) == 0 && (typ == tInt || typ == tTimestamp) {
+		p := parts[0]
+		vals, nulls, dense, err := p.loadColDense(colIdx)
+		hasNull := false
+		for _, w := range nulls {
+			if w != 0 {
+				hasNull = true
+				break
+			}
+		}
+		if err == nil && dense && !hasNull {
+			dels, err := p.loadDels()
+			if err == nil {
+				hasDel := false
+				for _, d := range dels {
+					if d {
+						hasDel = true
+						break
+					}
+				}
+				if !hasDel {
+					v := poolNumVec()
+					v.typ = typ
+					v.ints = vals
+					v.count = len(vals)
+					v.borrowed = true
+					return v, true
+				}
+			}
 		}
 	}
 	n := 0

@@ -270,6 +270,7 @@ func (m *Manager) Handle(req *proto.Request) *proto.Response {
 		r, err := m.route(st)
 		if m.isRead(st) {
 			m.met.recordRead(time.Since(start))
+			m.met.recordClass(classOf(st), time.Since(start))
 		} else {
 			m.met.recordWrite(time.Since(start))
 		}

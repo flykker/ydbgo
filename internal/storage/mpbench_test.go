@@ -139,3 +139,92 @@ func TestGroupAlloc(t *testing.T) {
 		t.Fatalf("count = %d, want 1000000", r.Rows[0][0].Int)
 	}
 }
+
+// BenchmarkFilteredSumNoPrune measures a WHERE on a column whose value repeats
+// inside every granule (g = id % 100, so each granule's zone covers [0,99] and
+// nothing can be pruned): the zone-map worst case.
+func BenchmarkFilteredSumNoPrune(b *testing.B) {
+	e, err := Open(b.TempDir() + "/db")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer e.Close()
+	ex := sqlx.NewExecutor(e)
+	tn := "bt"
+	if _, err := ex.Execute(mustParse(b, "CREATE TABLE "+tn+" (id int64 primary key, v string, g int64) ENGINE=CSTORE2")[0]); err != nil {
+		b.Fatal(err)
+	}
+	for start := 0; start < 1000000; start += 65536 {
+		end := start + 65536
+		if end > 1000000 {
+			end = 1000000
+		}
+		s := start
+		e.UpdateBatch(func() error {
+			for i := s; i < end; i++ {
+				if err := e.Insert(tn, map[string]sqlx.Value{"id": sqlx.IntValue(int64(i)), "v": sqlx.StrValue(fmt.Sprintf("v%d", i)), "g": sqlx.IntValue(int64(i % 100))}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	if _, err := e.Compact(tn); err != nil {
+		b.Fatal(err)
+	}
+	st := mustParse(b, "SELECT SUM(g) AS s FROM "+tn+" WHERE g = 42")[0]
+	b.Run("filtered_sum_g_eq_42", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := ex.Execute(st); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkFilteredSumPrune measures a WHERE on a monotonically increasing
+// column (score = id): each granule's zone excludes every other granule's
+// range, so the filtered scan decodes exactly one granule instead of the whole
+// 1M-row part. This is the zone-map payoff path.
+func BenchmarkFilteredSumPrune(b *testing.B) {
+	e, err := Open(b.TempDir() + "/db")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer e.Close()
+	ex := sqlx.NewExecutor(e)
+	tn := "bt"
+	if _, err := ex.Execute(mustParse(b, "CREATE TABLE "+tn+" (id int64 primary key, v string, score int64) ENGINE=CSTORE2")[0]); err != nil {
+		b.Fatal(err)
+	}
+	for start := 0; start < 1000000; start += 65536 {
+		end := start + 65536
+		if end > 1000000 {
+			end = 1000000
+		}
+		s := start
+		e.UpdateBatch(func() error {
+			for i := s; i < end; i++ {
+				if err := e.Insert(tn, map[string]sqlx.Value{"id": sqlx.IntValue(int64(i)), "v": sqlx.StrValue(fmt.Sprintf("v%d", i)), "score": sqlx.IntValue(int64(i))}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	if _, err := e.Compact(tn); err != nil {
+		b.Fatal(err)
+	}
+	st := mustParse(b, "SELECT SUM(score) AS s FROM "+tn+" WHERE score = 42")[0]
+	b.Run("filtered_sum_score_eq_42", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := ex.Execute(st); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

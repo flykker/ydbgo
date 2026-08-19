@@ -215,3 +215,33 @@ func TestMetaPlacementRF(t *testing.T) {
 		t.Errorf("rf=2 but shard on %v", sh.Nodes)
 	}
 }
+
+func TestQueryClass(t *testing.T) {
+	parse := func(q string) sqlx.Statement {
+		stmts, err := sqlx.Parse(q)
+		if err != nil || len(stmts) == 0 {
+			t.Fatalf("parse %q: %v", q, err)
+		}
+		return stmts[0]
+	}
+	cases := []struct {
+		q     string
+		want  string
+	}{
+		{"SELECT COUNT(*) FROM t", "agg"},
+		{"SELECT SUM(id) FROM t", "agg"},
+		{"SELECT AVG(id) AS a FROM t", "agg"},
+		{"SELECT g, COUNT(*) FROM t GROUP BY g", "group"},
+		{"SELECT * FROM t ORDER BY id DESC LIMIT 3", "order"},
+		{"SELECT * FROM t WHERE id = 42", "point"},
+		{"SELECT * FROM t", "scan"},
+		{"SELECT * FROM t WHERE g = 7 AND v = 'x'", "point"},
+		{"SELECT id FROM t WHERE id > 5", "point"},
+	}
+	for _, c := range cases {
+		got := classOf(parse(c.q))
+		if got != c.want {
+			t.Errorf("classOf(%q) = %q, want %q", c.q, got, c.want)
+		}
+	}
+}

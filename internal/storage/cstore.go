@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"ydbgo/internal/kv"
+	sqlx "ydbgo/internal/sql"
 )
 
 // errStop is an internal sentinel to end a bounded scan early (used by
@@ -540,11 +541,12 @@ func (t *cstoreTx) colEachRangeIt(table string, colIdx int, plLower, plUpper []b
 // the column range is scanned once (no per-cell reader/closure decode) and
 // aggregates run over the dense arrays afterwards.
 type numVec struct {
-	typ    sqlType
-	count  int
-	ints   []int64
-	floats []float64
-	nulls  []uint64 // bit p set => cell p is NULL
+	typ      sqlType
+	count    int
+	ints     []int64
+	floats   []float64
+	nulls    []uint64 // bit p set => cell p is NULL
+	borrowed bool     // slices reference part caches; putNumVec must not recycle
 }
 
 // numVecPool recycles the 8-16MB dense column buffers between queries. Large
@@ -558,10 +560,14 @@ func poolNumVec() *numVec {
 	v := numVecPool.Get().(*numVec)
 	v.ints, v.floats, v.nulls = v.ints[:0], v.floats[:0], v.nulls[:0]
 	v.count = 0
+	v.borrowed = false
 	return v
 }
 
 func putNumVec(v *numVec) {
+	if v.borrowed {
+		return // borrowed slices alias part caches; never recycle them
+	}
 	numVecPool.Put(v)
 }
 
@@ -632,6 +638,12 @@ func (t *cstoreTx) colDecodeNumeric(table string, colIdx int, typ sqlType, plLow
 		return nil
 	})
 	return v, err
+}
+
+// colDecodeNumericFiltered is colDecodeNumeric; the row-store format keeps no
+// zone maps, so there is nothing to prune.
+func (t *cstoreTx) colDecodeNumericFiltered(table string, colIdx int, typ sqlType, pred *sqlx.ColumnFilter, plLower, plUpper []byte) (*numVec, error) {
+	return t.colDecodeNumeric(table, colIdx, typ, plLower, plUpper)
 }
 
 // eachDesc is each iterating in reverse byte order.

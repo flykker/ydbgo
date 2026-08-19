@@ -7,6 +7,7 @@ package storage
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -744,4 +745,217 @@ func TestMpartGranulePoint(t *testing.T) {
 	defer e.Close()
 	ex = sqlx.NewExecutor(e)
 	check("patched")
+}
+
+// TestMpartZoneMap verifies the per-granule numeric zone maps (idx ver 3):
+// writePart computes min/max bounds per dense column, reopen decodes them, and
+// filtered count/aggregate scans skip granules whose bounds cannot match the
+// predicate.
+func TestMpartZoneMap(t *testing.T) {
+	if mpartGranuleRows < 2 {
+		t.Fatal("granule format requires mpartGranuleRows >= 2")
+	}
+	dir := t.TempDir() + "/db"
+	e, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex := sqlx.NewExecutor(e)
+	if _, err := ex.Execute(mustParse(t, "CREATE TABLE g (id int64 primary key, v string, g int64, score float) ENGINE=CSTORE2")[0]); err != nil {
+		t.Fatal(err)
+	}
+	const n = mpartGranuleRows*3 + 7
+	for start := 0; start < n; start += mpartGranuleRows {
+		if err := e.UpdateBatch(func() error {
+			for i := start; i < n && i < start+mpartGranuleRows; i++ {
+				e.Insert("g", map[string]sqlx.Value{
+					"id":    sqlx.IntValue(int64(i)),
+					"v":     sqlx.StrValue(fmt.Sprintf("v%d", i)),
+					"g":     sqlx.IntValue(int64(i % 100)),
+					"score": sqlx.FloatValue(float64(i)),
+				})
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ms, ok := e.store("CSTORE2").(*mpartStore)
+	if !ok {
+		t.Fatal("not mpart store")
+	}
+	for i := 0; i < 5; i++ {
+		ms.flush("g")
+		ms.mergeIdle(time.Now())
+	}
+	ms.mu.Lock()
+	parts := append([]*mpart(nil), ms.parts["g"]...)
+	ms.mu.Unlock()
+	if len(parts) == 0 {
+		t.Fatal("no parts after flush/merge")
+	}
+	// g = id % 100: every granule covers [0, 99], score = id is monotonic so
+	// each granule's score zone must be its id window and exclude all others.
+	colG := -1
+	colScore := -1
+	tbl, err := e.getTable("g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ci, c := range tbl.cols {
+		if c.name == "g" {
+			colG = ci
+		}
+		if c.name == "score" {
+			colScore = ci
+		}
+	}
+	if colG < 0 || colScore < 0 {
+		t.Fatal("columns g/score not found")
+	}
+	for _, p := range parts {
+		if mpartIdxVer < 3 || colG >= len(p.granules[0].zoneMin) {
+			t.Skip("zone maps require idx ver 3")
+		}
+		t.Logf("part ncols=%d colFmts=%v pkMin=%q", p.ncols, p.colFmts, p.pkMin)
+		for gi := range p.granules {
+			vals, nulls, err := p.loadGranuleDense(gi, colScore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, w := range nulls {
+				if w != 0 {
+					t.Fatalf("score column has nulls")
+				}
+			}
+			minF, maxF := math.Inf(1), math.Inf(-1)
+			for _, raw := range vals {
+				f := math.Float64frombits(uint64(raw))
+				if f < minF {
+					minF = f
+				}
+				if f > maxF {
+					maxF = f
+				}
+			}
+			zMin := math.Float64frombits(uint64(p.granules[gi].zoneMin[colScore]))
+			zMax := math.Float64frombits(uint64(p.granules[gi].zoneMax[colScore]))
+			if zMin != minF || zMax != maxF {
+				t.Fatalf("granule %d score zone = [%v,%v], want [%v,%v]", gi, zMin, zMax, minF, maxF)
+			}
+		}
+	}
+	// A filtered aggregate over the monotonic score column must return the
+	// right single row (and skip unrelated granules).
+	r := execOK(t, ex, "SELECT count(*), sum(id) FROM g WHERE score = 42")
+	if len(r.Rows) != 1 || r.Rows[0][0].Int != 1 || r.Rows[0][1].Int != 42 {
+		t.Fatalf("filtered agg score=42: %v", r.Rows)
+	}
+	// g = id % 100 repeats within a granule; the count must still be exact.
+	r = execOK(t, ex, "SELECT count(*) FROM g WHERE g = 42")
+	if len(r.Rows) != 1 || r.Rows[0][0].Int != int64(n/100) {
+		t.Fatalf("filtered count g=42: %v", r.Rows)
+	}
+	e.Close()
+	// Reopen: zones survive a roundtrip through readMpartMeta.
+	e, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	ex = sqlx.NewExecutor(e)
+	r = execOK(t, ex, "SELECT count(*), sum(id) FROM g WHERE score = 42")
+	if len(r.Rows) != 1 || r.Rows[0][0].Int != 1 || r.Rows[0][1].Int != 42 {
+		t.Fatalf("filtered agg after reopen score=42: %v", r.Rows)
+	}
+	ms, _ = e.store("CSTORE2").(*mpartStore)
+	ms.mu.Lock()
+	parts = append([]*mpart(nil), ms.parts["g"]...)
+	ms.mu.Unlock()
+	for _, p := range parts {
+		for gi := range p.granules {
+			vals, nulls, err := p.loadGranuleDense(gi, colScore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, w := range nulls {
+				if w != 0 {
+					t.Fatalf("after reopen score column has nulls")
+				}
+			}
+			minF, maxF := math.Inf(1), math.Inf(-1)
+			for _, raw := range vals {
+				f := math.Float64frombits(uint64(raw))
+				if f < minF {
+					minF = f
+				}
+				if f > maxF {
+					maxF = f
+				}
+			}
+			zMin := math.Float64frombits(uint64(p.granules[gi].zoneMin[colScore]))
+			zMax := math.Float64frombits(uint64(p.granules[gi].zoneMax[colScore]))
+			if zMin != minF || zMax != maxF {
+				t.Fatalf("after reopen granule %d score zone = [%v,%v], want [%v,%v]", gi, zMin, zMax, minF, maxF)
+			}
+		}
+	}
+}
+
+// TestMpartPreloadDense verifies the background dense-column prefetch: after a
+// flush that crosses the idle threshold, queuePreload runs preloadDense on the
+// new part, so loadColDense returns cached values without an explicit query.
+func TestMpartPreloadDense(t *testing.T) {
+	dir := t.TempDir() + "/db"
+	e, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	ex := sqlx.NewExecutor(e)
+	if _, err := ex.Execute(mustParse(t, "CREATE TABLE g (id int64 primary key, v string, g int64) ENGINE=CSTORE2")[0]); err != nil {
+		t.Fatal(err)
+	}
+	const n = mpartIdleFlushMinRows + 100
+	for start := 0; start < n; start += mpartFlushThreshold {
+		e.UpdateBatch(func() error {
+			for i := start; i < n; i++ {
+				e.Insert("g", map[string]sqlx.Value{"id": sqlx.IntValue(int64(i)), "v": sqlx.StrValue(fmt.Sprintf("v%d", i)), "g": sqlx.IntValue(int64(i % 100))})
+			}
+			return nil
+		})
+	}
+	ms := e.store("CSTORE2").(*mpartStore)
+	// Simulate the idle flusher: last write is old, so flushIdle flushes the
+	// mem tail and queues the new part for preload.
+	ms.mu.Lock()
+	ms.lastWrite["g"] = time.Now().Add(-2 * mpartIdleFlushInterval)
+	ms.mu.Unlock()
+	ms.flushIdle(time.Now())
+	// Wait for the prefetch worker to drain the queue. denseVals is written
+	// before the part is published to the preload channel and loadColDense
+	// sync.Once makes the write visible to subsequent readers.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ms.mu.Lock()
+		parts := append([]*mpart(nil), ms.parts["g"]...)
+		done := true
+		for _, p := range parts {
+			if p.denseVals == nil || len(p.denseVals) == 0 || len(p.denseVals[0]) == 0 {
+				done = false
+				break
+			}
+		}
+		ms.mu.Unlock()
+		if done || len(parts) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("preload did not populate dense cache in time")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(ms.parts["g"]) == 0 {
+		t.Fatal("no parts after idle flush")
+	}
 }

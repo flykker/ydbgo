@@ -556,7 +556,7 @@ func (e *Engine) ColumnCountFiltered(table string, pred *sqlx.ColumnFilter, r *s
 		// range is bulk-decoded into a dense array, then equality-matched
 		// against the literal in a tight loop.
 		if ctyp == tInt || ctyp == tFloat || ctyp == tTimestamp {
-			v, err := ct.colDecodeNumeric(table, pred.Col, ctyp, plLower, plUpper)
+			v, err := ct.colDecodeNumericFiltered(table, pred.Col, ctyp, pred, plLower, plUpper)
 			if err != nil {
 				return err
 			}
@@ -672,7 +672,7 @@ func (e *Engine) ColumnAggregatesFiltered(table string, colIdx int, aggs []strin
 			// Same-column numeric filter: vectorized decode, then equality
 			// match + accumulate in one tight pass.
 			if ctyp == tInt || ctyp == tFloat || ctyp == tTimestamp {
-				v, err := ct.colDecodeNumeric(table, colIdx, ctyp, plLower, plUpper)
+				v, err := ct.colDecodeNumericFiltered(table, colIdx, ctyp, pred, plLower, plUpper)
 				if err != nil {
 					return err
 				}
@@ -1077,6 +1077,40 @@ func (a *colAccum) add(v sqlValue) error {
 		a.avgN++
 	}
 	return nil
+}
+
+// merge folds another accumulator's partial results into a. Used by the
+// parallel per-granule aggregation path to combine partial aggregates.
+func (a *colAccum) merge(o *colAccum) {
+	if o == nil {
+		return
+	}
+	a.cnt += o.cnt
+	if o.any {
+		a.sum += o.sum
+		a.any = true
+		if !o.sumInt {
+			a.sumInt = false
+		}
+	}
+	if a.flags&(accMin|accMax) != 0 && (o.minSet || o.maxSet) {
+		if o.minSet {
+			if !a.minSet {
+				a.minV, a.minSet = o.minV, true
+			} else if c, err := compareSQLValue(o.minV, a.minV); err == nil && c < 0 {
+				a.minV = o.minV
+			}
+		}
+		if o.maxSet {
+			if !a.maxSet {
+				a.maxV, a.maxSet = o.maxV, true
+			} else if c, err := compareSQLValue(o.maxV, a.maxV); err == nil && c > 0 {
+				a.maxV = o.maxV
+			}
+		}
+	}
+	a.avgTotal += o.avgTotal
+	a.avgN += o.avgN
 }
 
 func (a *colAccum) result(aggs []string) []sqlx.Value {

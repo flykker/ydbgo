@@ -145,6 +145,25 @@ type promMetric struct {
 	Reads        int64              `json:"reads"`
 	WriteLatency map[string]float64 `json:"write_latency_ms"`
 	ReadLatency  map[string]float64 `json:"read_latency_ms"`
+	raw          map[string]json.RawMessage
+}
+
+// ClassLatencies extracts the per-query-class latency buckets (<class>
+// _latency_ms) from the raw payload. Classes are added by the shard metrics
+// reporter as dynamic keys, so they are not fixed struct fields.
+func (m *promMetric) ClassLatencies() map[string]map[string]float64 {
+	out := map[string]map[string]float64{}
+	for k, raw := range m.raw {
+		if !strings.HasSuffix(k, "_latency_ms") || k == "write_latency_ms" || k == "read_latency_ms" {
+			continue
+		}
+		var lat map[string]float64
+		if err := json.Unmarshal(raw, &lat); err != nil {
+			continue
+		}
+		out[strings.TrimSuffix(k, "_latency_ms")] = lat
+	}
+	return out
 }
 
 // handlePromMetrics exposes the cluster metrics in Prometheus text format
@@ -168,6 +187,9 @@ func (s *Server) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal([]byte(nm.JSON), &m); err != nil {
 			continue
 		}
+		if err := json.Unmarshal([]byte(nm.JSON), &m.raw); err != nil {
+			continue
+		}
 		fmt.Fprintf(&b, "ydbgo_requests_total{node=%s,type=\"write\"}  %d\n", node, m.Writes)
 		fmt.Fprintf(&b, "ydbgo_requests_total{node=%s,type=\"read\"}  %d\n", node, m.Reads)
 		emitLat := func(name string, lat map[string]float64) {
@@ -183,6 +205,11 @@ func (s *Server) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		emitLat("write", m.WriteLatency)
 		emitLat("read", m.ReadLatency)
+		// Per-query-class buckets (agg/group/order/scan/point/kv), present as
+		// dynamic <class>_latency_ms keys.
+		for k, v := range m.ClassLatencies() {
+			emitLat(k, v)
+		}
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

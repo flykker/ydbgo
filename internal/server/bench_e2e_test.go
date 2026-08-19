@@ -119,7 +119,7 @@ func TestBenchConcurrentWrites(t *testing.T) {
 		t.Fatalf("ADMIN METRICS produced no output")
 	}
 	note := resp.Result.Note
-	for _, want := range []string{"write_latency_ms", "p50=", "p99=", "writes="} {
+	for _, want := range []string{"write_latency_ms", "p50=", "p99=", "writes=", "agg_latency_ms"} {
 		if !strings.Contains(note, want) {
 			t.Errorf("ADMIN METRICS missing %q in: %s", want, note)
 		}

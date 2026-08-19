@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/pierrec/lz4/v4"
+	sqlx "ydbgo/internal/sql"
 )
 
 // mpartFlushThreshold is the mem-part row count that triggers a flush to a
@@ -62,7 +63,7 @@ const (
 	mpartGranuleRows = 65536
 
 	mpartIdxMagic = "MPIDX1"
-	mpartIdxVer   = 2
+	mpartIdxVer   = 3
 )
 
 // Column format tags stored per column in meta.bin. colFmtLegacy means the
@@ -124,6 +125,12 @@ type mpartGranule struct {
 	colOff []int64 // per column: offset of this granule's block in col_N.bin
 	colLen []int64
 	colRaw []int64 // per column: uncompressed size (0 = frame)
+	// zoneMin/zoneMax are per-dense-column value bounds over the granule's rows
+	// (idx ver 3; nil for legacy/framed columns). They let filtered scans skip
+	// granules whose values cannot match a numeric WHERE predicate (ClickHouse
+	// zone maps / secondary minmax index analog).
+	zoneMin []int64
+	zoneMax []int64
 }
 
 // mpart is an immutable part on disk: pks sorted ascending, one column file
@@ -195,6 +202,20 @@ type mpart struct {
 	gColsOnce [][]sync.Once
 	gCols     [][][][]byte
 	gColsErr  [][]error
+
+	// gDense caches per-granule dense numeric values ([colIdx][g]), decoded
+	// lazily by zone-map-filtered scans that only touch the granules whose
+	// value bounds can satisfy the predicate.
+	gDenseOnce  [][]sync.Once
+	gDense      [][][]int64
+	gDenseNulls [][][]uint64
+	gDenseErr   [][]error
+
+	// preloadOnce guards the background eager decode of every dense column
+	// (loadColDense), launched right after an idle flush/merge so the first
+	// SUM/GROUP query finds a warm decode cache instead of paying the cold
+	// LZ4 pass inline.
+	preloadOnce sync.Once
 }
 
 // inRange reports whether the part's PK span intersects [lo, hi) (nil = open).
@@ -235,6 +256,12 @@ type mpartStore struct {
 	lastWrite map[string]time.Time
 	stopFlush chan struct{}
 	flushDone chan struct{}
+
+	// preloadCh queues freshly flushed/merged parts whose dense columns should
+	// be decoded in the background before the first query touches them. The
+	// buffer is bounded; when full, the part is simply skipped (the query path
+	// still decodes lazily).
+	preloadCh chan *mpart
 }
 
 // openMpart opens (creating if needed) an mpart store rooted at dir.
@@ -252,6 +279,7 @@ func openMpart(dir string) (*mpartStore, error) {
 		lastWrite: map[string]time.Time{},
 		stopFlush: make(chan struct{}),
 		flushDone: make(chan struct{}),
+		preloadCh: make(chan *mpart, 16),
 	}
 	idMax := 0
 	entries, err := os.ReadDir(parts)
@@ -316,6 +344,19 @@ func (s *mpartStore) startIdleFlusher() {
 			}
 		}
 	}()
+	// Background dense-column prefetch: freshly flushed/merged parts are
+	// decoded eagerly so the first aggregate query sees a warm cache. A
+	// separate goroutine keeps this from adding latency to the flusher tick.
+	go func() {
+		for {
+			select {
+			case <-s.stopFlush:
+				return
+			case p := <-s.preloadCh:
+				p.preloadDense()
+			}
+		}
+	}()
 }
 
 // partsOverlap reports whether the table's on-disk parts overlap pairwise in
@@ -364,6 +405,28 @@ func (s *mpartStore) mergeIdle(now time.Time) {
 			// retries next tick). The store has no logger, so this is surfaced
 			// only via the returned error.
 			_ = err
+			continue
+		}
+		s.queuePreload(tbl)
+	}
+}
+
+// queuePreload schedules the table's dense columns for background decode. Only
+// parts with at least mpartIdleFlushMinRows rows are worth the prefetch; small
+// trailing parts decode trivially on demand.
+func (s *mpartStore) queuePreload(tbl string) {
+	s.mu.Lock()
+	parts := append([]*mpart(nil), s.parts[tbl]...)
+	s.mu.Unlock()
+	for _, p := range parts {
+		if p == nil || p.rowcount < mpartIdleFlushMinRows {
+			continue
+		}
+		select {
+		case s.preloadCh <- p:
+		default:
+			// Channel full: the prefetch worker is busy; skip rather than
+			// block the flusher.
 		}
 	}
 }
@@ -372,7 +435,7 @@ func (s *mpartStore) mergeIdle(now time.Time) {
 // mpartIdleFlushInterval and holds at least mpartIdleFlushMinRows rows.
 func (s *mpartStore) flushIdle(now time.Time) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var flushed []string
 	for tbl, mp := range s.mem {
 		if mp == nil || len(mp.rows) < mpartIdleFlushMinRows {
 			continue
@@ -389,7 +452,13 @@ func (s *mpartStore) flushIdle(now time.Time) {
 			// the next tick retries. Failure is only logged via the error
 			// return; callers with a logger may handle it.
 			_ = err
+		} else {
+			flushed = append(flushed, tbl)
 		}
+	}
+	s.mu.Unlock()
+	for _, tbl := range flushed {
+		s.queuePreload(tbl)
 	}
 }
 
@@ -564,16 +633,32 @@ func (s *mpartStore) writePart(tbl string, rows []*memRow) (*mpart, error) {
 		p.gColsOnce = make([][]sync.Once, ncols)
 		p.gCols = make([][][][]byte, ncols)
 		p.gColsErr = make([][]error, ncols)
+		if mpartIdxVer >= 3 {
+			p.gDenseOnce = make([][]sync.Once, ncols)
+			p.gDense = make([][][]int64, ncols)
+			p.gDenseNulls = make([][][]uint64, ncols)
+			p.gDenseErr = make([][]error, ncols)
+		}
 		for c := 0; c < ncols; c++ {
 			p.gColsOnce[c] = make([]sync.Once, ng)
 			p.gCols[c] = make([][][]byte, ng)
 			p.gColsErr[c] = make([]error, ng)
+			if mpartIdxVer >= 3 {
+				p.gDenseOnce[c] = make([]sync.Once, ng)
+				p.gDense[c] = make([][]int64, ng)
+				p.gDenseNulls[c] = make([][]uint64, ng)
+				p.gDenseErr[c] = make([]error, ng)
+			}
 		}
 		for c := 0; c < ncols; c++ {
 			for g := range p.granules {
 				p.granules[g].colOff = append(p.granules[g].colOff, 0)
 				p.granules[g].colLen = append(p.granules[g].colLen, 0)
 				p.granules[g].colRaw = append(p.granules[g].colRaw, 0)
+				if mpartIdxVer >= 3 {
+					p.granules[g].zoneMin = append(p.granules[g].zoneMin, 0)
+					p.granules[g].zoneMax = append(p.granules[g].zoneMax, 0)
+				}
 			}
 		}
 		// pk.bin: one LZ4 block per granule.
@@ -617,7 +702,9 @@ func (s *mpartStore) writePart(tbl string, rows []*memRow) (*mpart, error) {
 		for g := range p.granules {
 			p.granules[g].delOff, p.granules[g].delLen, p.granules[g].delRaw = delOffs[g].off, delOffs[g].len, delOffs[g].raw
 		}
-		// Record each granule's PK window (last PK of the block).
+		// Record each granule's PK window (last PK of the block) and the
+		// per-dense-column value zones (idx ver 3) so filtered scans can skip
+		// granules that cannot match a numeric WHERE predicate.
 		for g := range p.granules {
 			lo := g * mpartGranuleRows
 			hi := lo + mpartGranuleRows
@@ -625,8 +712,18 @@ func (s *mpartStore) writePart(tbl string, rows []*memRow) (*mpart, error) {
 				hi = len(rows)
 			}
 			p.granules[g].pkMax = append([]byte(nil), rows[hi-1].pk...)
+			if mpartIdxVer >= 3 {
+				for c := 0; c < ncols; c++ {
+					if !colDenseOK[c] {
+						continue
+					}
+					minV, maxV := granuleNumericZone(rows[lo:hi], c, colDense[c])
+					p.granules[g].zoneMin[c] = minV
+					p.granules[g].zoneMax[c] = maxV
+				}
+			}
 		}
-		granuleRaw = encodeGranuleIndex(p.granules, ncols)
+		granuleRaw = encodeGranuleIndex(p.granules, ncols, p.colFmts)
 		if err := os.WriteFile(filepath.Join(dir, "idx.bin"), granuleRaw, 0o644); err != nil {
 			return nil, err
 		}
@@ -680,6 +777,38 @@ func pkBlobs(rows []*memRow, lo, hi int) [][]byte {
 	return out
 }
 
+// granuleNumericZone returns the (min, max) of a numeric column over the given
+// rows, as the raw encoded values (zigzag-decoded ints; float64 bit patterns
+// for tFloat). NULL cells are skipped; a granule with only NULLs yields
+// (0, 0), which never falsely matches a non-NULL predicate.
+func granuleNumericZone(rows []*memRow, colIdx int, typ sqlType) (min, max int64) {
+	min, max = 0, 0
+	first := true
+	for _, r := range rows {
+		if colIdx >= len(r.cells) {
+			continue
+		}
+		val, f, null, ok := decodeNumericCell(r.cells[colIdx], typ)
+		if !ok || null {
+			continue
+		}
+		if typ == tFloat {
+			val = int64(math.Float64bits(f))
+		}
+		if first {
+			min, max, first = val, val, false
+			continue
+		}
+		if val < min {
+			min = val
+		}
+		if val > max {
+			max = val
+		}
+	}
+	return min, max
+}
+
 // blockOff is a single granule block's byte range within its file. raw is the
 // uncompressed size (raw LZ4 blocks, idx ver 2); 0 means a framed block
 // (idx ver 1), decompressed via lz4Expand.
@@ -724,8 +853,10 @@ func mustLZ4Block(plain []byte) []byte {
 
 // encodeGranuleIndex serializes the sparse index (idx.bin): the number of
 // granules, each granule's PK window and per-file block offsets. Uncompressed
-// and tiny (one entry per mpartGranuleRows rows).
-func encodeGranuleIndex(gs []mpartGranule, ncols int) []byte {
+// and tiny (one entry per mpartGranuleRows rows). Index ver 3 additionally
+// stores per-dense-column zone maps (min/max over each granule's rows) so
+// filtered scans can skip granules that cannot match a numeric predicate.
+func encodeGranuleIndex(gs []mpartGranule, ncols int, colFmts []byte) []byte {
 	b := makeBuilder()
 	b.Str(mpartIdxMagic)
 	b.Var(mpartIdxVer)
@@ -744,17 +875,26 @@ func encodeGranuleIndex(gs []mpartGranule, ncols int) []byte {
 			b.Var(gs[i].colLen[c])
 			b.Var(gs[i].colRaw[c])
 		}
+		if mpartIdxVer >= 3 {
+			for c := 0; c < ncols; c++ {
+				if _, dense := colFmtType(colFmts[c]); !dense {
+					continue
+				}
+				b.Var(gs[i].zoneMin[c])
+				b.Var(gs[i].zoneMax[c])
+			}
+		}
 	}
 	return b.Bytes()
 }
 
-func decodeGranuleIndex(raw []byte, ncols int) ([]mpartGranule, error) {
+func decodeGranuleIndex(raw []byte, ncols int, colFmts []byte) ([]mpartGranule, error) {
 	r := makeReader(raw)
 	if r.Str() != mpartIdxMagic {
 		return nil, errors.New("bad mpart idx magic")
 	}
 	ver := r.Var()
-	if ver != 1 && ver != 2 {
+	if ver != 1 && ver != 2 && ver != 3 {
 		return nil, errors.New("bad mpart idx version")
 	}
 	if r.Var() != int64(ncols) {
@@ -786,6 +926,17 @@ func decodeGranuleIndex(raw []byte, ncols int) ([]mpartGranule, error) {
 				gs[i].colRaw = append(gs[i].colRaw, 0)
 			}
 		}
+		if ver >= 3 {
+			gs[i].zoneMin = make([]int64, ncols)
+			gs[i].zoneMax = make([]int64, ncols)
+			for c := 0; c < ncols; c++ {
+				if _, dense := colFmtType(colFmts[c]); !dense {
+					continue
+				}
+				gs[i].zoneMin[c] = r.Var()
+				gs[i].zoneMax[c] = r.Var()
+			}
+		}
 	}
 	if r.err != nil {
 		return nil, r.err
@@ -803,6 +954,32 @@ func (p *mpart) granuleFor(pk []byte) int {
 		return -1
 	}
 	return i
+}
+
+// granuleZoneHits reports whether granule g could contain a row whose column
+// colIdx satisfies a numeric equality predicate, using the per-granule zone
+// maps (idx ver 3). A nil zone (legacy column / no zones) always reports true
+// so the caller falls back to decoding the granule.
+func (p *mpart) granuleZoneHits(g, colIdx int, pred *sqlx.ColumnFilter, ctyp sqlType) bool {
+	if g < 0 || g >= len(p.granules) || colIdx >= len(p.granules[g].zoneMin) {
+		return true
+	}
+	lit := fromSQLValue(pred.Lit)
+	if lit.null {
+		return false
+	}
+	var lo, hi int64
+	switch ctyp {
+	case tFloat:
+		lo, hi = p.granules[g].zoneMin[colIdx], p.granules[g].zoneMax[colIdx]
+		lf := lit.f
+		return lf >= math.Float64frombits(uint64(lo)) && lf <= math.Float64frombits(uint64(hi))
+	case tInt, tTimestamp:
+		lo, hi = p.granules[g].zoneMin[colIdx], p.granules[g].zoneMax[colIdx]
+		return lit.i >= lo && lit.i <= hi
+	default:
+		return true
+	}
 }
 
 // readGranule reads the granule g's LZ4 block from path and expands it.
@@ -905,7 +1082,7 @@ func readMpartMeta(dir string) (*mpart, error) {
 		if err != nil {
 			return nil, err
 		}
-		gs, err := decodeGranuleIndex(idxRaw, p.ncols)
+		gs, err := decodeGranuleIndex(idxRaw, p.ncols, p.colFmts)
 		if err != nil {
 			return nil, err
 		}
@@ -919,10 +1096,18 @@ func readMpartMeta(dir string) (*mpart, error) {
 		p.gColsOnce = make([][]sync.Once, p.ncols)
 		p.gCols = make([][][][]byte, p.ncols)
 		p.gColsErr = make([][]error, p.ncols)
+		p.gDenseOnce = make([][]sync.Once, p.ncols)
+		p.gDense = make([][][]int64, p.ncols)
+		p.gDenseNulls = make([][][]uint64, p.ncols)
+		p.gDenseErr = make([][]error, p.ncols)
 		for c := 0; c < p.ncols; c++ {
 			p.gColsOnce[c] = make([]sync.Once, len(gs))
 			p.gCols[c] = make([][][]byte, len(gs))
 			p.gColsErr[c] = make([]error, len(gs))
+			p.gDenseOnce[c] = make([]sync.Once, len(gs))
+			p.gDense[c] = make([][]int64, len(gs))
+			p.gDenseNulls[c] = make([][]uint64, len(gs))
+			p.gDenseErr[c] = make([]error, len(gs))
 		}
 	}
 	if r.err != nil {
@@ -978,6 +1163,34 @@ func (p *mpart) loadGranuleDels(g int) ([]bool, error) {
 		p.gDels[g] = out
 	})
 	return p.gDels[g], p.gDelsErr[g]
+}
+
+// loadGranuleDense decodes just granule g's numeric cells of one dense column
+// into packed (vals, nulls) form (v4 parts). The result is cached; it is used
+// by zone-map-filtered scans that skip granules whose value bounds cannot
+// match the predicate.
+func (p *mpart) loadGranuleDense(g, colIdx int) ([]int64, []uint64, error) {
+	if g < 0 || g >= len(p.granules) || colIdx >= p.ncols {
+		return nil, nil, nil
+	}
+	if colIdx >= len(p.gDenseOnce) {
+		return nil, nil, nil
+	}
+	p.gDenseOnce[colIdx][g].Do(func() {
+		raw, err := p.readGranule(p.colPath(colIdx), p.granules[g].colOff[colIdx], p.granules[g].colLen[colIdx], p.granules[g].colRaw[colIdx])
+		if err != nil {
+			p.gDenseErr[colIdx][g] = err
+			return
+		}
+		vals, nulls, err := decodeDenseNumeric(raw)
+		if err != nil {
+			p.gDenseErr[colIdx][g] = err
+			return
+		}
+		p.gDense[colIdx][g] = vals
+		p.gDenseNulls[colIdx][g] = nulls
+	})
+	return p.gDense[colIdx][g], p.gDenseNulls[colIdx][g], p.gDenseErr[colIdx][g]
 }
 
 // loadGranuleCol decodes just granule g's cells of one column (v4 parts). The
@@ -1232,6 +1445,34 @@ func (p *mpart) loadColDense(colIdx int) (vals []int64, nulls []uint64, ok bool,
 		p.denseNulls[colIdx] = nulls
 	})
 	return p.denseVals[colIdx], p.denseNulls[colIdx], true, p.denseErr[colIdx]
+}
+
+// preloadDense eagerly decodes every dense numeric column into the part's
+// memoized dense cache, so the first SUM/GROUP query after an idle flush/merge
+// finds warm values instead of paying the cold LZ4 pass inline. Runs on the
+// idle-flusher goroutine; the cache is populated by the same loadColDense
+// paths the query would use, so this is pure prefetch.
+func (p *mpart) preloadDense() {
+	if p == nil {
+		return
+	}
+	p.preloadOnce.Do(func() {
+		var wg sync.WaitGroup
+		for c := 0; c < p.ncols; c++ {
+			if c >= len(p.colFmts) {
+				continue
+			}
+			if _, dense := colFmtType(p.colFmts[c]); !dense {
+				continue
+			}
+			wg.Add(1)
+			go func(col int) {
+				defer wg.Done()
+				_, _, _, _ = p.loadColDense(col)
+			}(c)
+		}
+		wg.Wait()
+	})
 }
 
 // loadRows returns the sorted PKs and every column's cells (parallel, full
