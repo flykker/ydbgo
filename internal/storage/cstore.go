@@ -323,10 +323,15 @@ func joinRow(cells [][]byte) []byte {
 }
 
 func (t *cstoreTx) rowPut(table string, key []byte, val []byte) error {
-	n, cells, err := splitRow(val)
+	_, cells, err := splitRow(val)
 	if err != nil {
 		return err
 	}
+	return t.rowPutCells(table, key, cells)
+}
+
+func (t *cstoreTx) rowPutCells(table string, key []byte, cells [][]byte) error {
+	n := len(cells)
 	// A row that becomes live raises the table's live count; an overwrite of
 	// an already-live row does not. The existence read goes through the
 	// overlay so repeated writes of the same pk in one tx are exact.

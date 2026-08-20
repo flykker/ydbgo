@@ -165,7 +165,7 @@ func putRow(t *table, tx storeTx, vals map[string]sqlValue) error {
 			removeRowIndexes(t, ov, key)
 		}
 	}
-	if err := tx.rowPut(t.name, []byte(key), encodeRow(vals, t)); err != nil {
+	if err := tx.rowPutCells(t.name, []byte(key), encodeRowCells(vals, t)); err != nil {
 		return err
 	}
 	addRowIndexes(t, vals, key)
@@ -438,6 +438,20 @@ func encodeRow(vals map[string]sqlValue, t *table) []byte {
 		b.Variant(vals[c.name])
 	}
 	return b.Bytes()
+}
+
+// encodeRowCells encodes each column's value into its own cell blob, in table
+// column order, without the intermediate full-row blob that encodeRow produces.
+// Cells are laid out exactly as splitRow would produce them from the row blob,
+// so a store that stores column-major can use them directly.
+func encodeRowCells(vals map[string]sqlValue, t *table) [][]byte {
+	cells := make([][]byte, len(t.cols))
+	for i, c := range t.cols {
+		b := makeBuilder()
+		b.Variant(vals[c.name])
+		cells[i] = b.Bytes()
+	}
+	return cells
 }
 
 func decodeRow(data []byte, t *table) (map[string]sqlValue, error) {

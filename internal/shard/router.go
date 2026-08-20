@@ -36,6 +36,8 @@ func (m *Manager) handleAdmin(req *proto.Request, upper string) *proto.Response 
 		return m.handleShardPeers(req)
 	case strings.HasPrefix(upper, "ADMIN SHARD-WAIT-LEADER "):
 		return m.handleShardWaitLeader(req)
+	case strings.HasPrefix(upper, "ADMIN EXEC-SHARD-ENC "):
+		return m.handleExecShardEnc(req)
 	case strings.HasPrefix(upper, "ADMIN EXEC-SHARD "):
 		return m.handleExecShard(req)
 	case strings.HasPrefix(upper, "ADMIN SCAN-SHARD "):
@@ -296,6 +298,59 @@ func (m *Manager) handleExecShard(req *proto.Request) *proto.Response {
 		return fail(req, err)
 	}
 	return &proto.Response{ID: req.ID, OK: true, Result: payloadOf(r)}
+}
+
+// handleExecShardEnc applies an encoded DML statement to a local shard group
+// without re-parsing SQL text. Syntax: ADMIN EXEC-SHARD-ENC <shard-id> <base64>
+// where base64 is sqlx.EncodeStatements of one (or more) already-parsed
+// statements. Used by execShardSQLStmt so a shard-forwarded write is parsed
+// exactly once, on the coordinator.
+func (m *Manager) handleExecShardEnc(req *proto.Request) *proto.Response {
+	fields := strings.Fields(req.SQL)
+	if len(fields) != 4 {
+		return fail(req, fmt.Errorf("usage: ADMIN EXEC-SHARD-ENC <shard-id> <base64> (got %d fields: %q)", len(fields), req.SQL))
+	}
+	shardID := fields[2]
+	sh := m.localShard(shardID)
+	if sh == nil {
+		return fail(req, fmt.Errorf("shard %s not mounted locally", shardID))
+	}
+	if sh.frozen {
+		return fail(req, fmt.Errorf("shard %s is splitting, retry", shardID))
+	}
+	if !sh.node.IsLeader() {
+		addr, err := m.shardLeaderSQLAddr(sh, 5*time.Second)
+		if err != nil {
+			return fail(req, err)
+		}
+		if addr != m.sqlAddr {
+			resp, err := m.remoteAdmin(addr, req.SQL)
+			if err != nil {
+				return fail(req, err)
+			}
+			resp.ID = req.ID
+			return resp
+		}
+		// we are the leader but the election just finished; fall through
+	}
+	enc := strings.TrimSpace(strings.TrimPrefix(req.SQL, "ADMIN EXEC-SHARD-ENC "+shardID))
+	raw, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		return fail(req, err)
+	}
+	stmts, err := sqlx.DecodeStatements(raw)
+	if err != nil {
+		return fail(req, err)
+	}
+	var last *sqlx.Result
+	for _, st := range stmts {
+		r, err := sh.node.ExecuteStmt(st)
+		if err != nil {
+			return fail(req, err)
+		}
+		last = r
+	}
+	return &proto.Response{ID: req.ID, OK: true, Result: payloadOf(last)}
 }
 
 // handleScanShard returns the rows of one shard for a (possibly projected or
@@ -740,7 +795,7 @@ func (m *Manager) execInsert(st *sqlx.InsertStmt) (*sqlx.Result, error) {
 		go func(spec *ShardSpec, rows [][]sqlx.Expr) {
 			defer wg.Done()
 			batch := &sqlx.InsertStmt{Table: st.Table, Columns: st.Columns, Rows: rows}
-			resp, err := m.execShardSQL(spec, sqlx.StatementString(batch))
+			resp, err := m.execShardSQLStmt(spec, batch)
 			if err != nil && firstErr == nil {
 				firstErr = err
 			}
@@ -767,16 +822,16 @@ func (m *Manager) execInsert(st *sqlx.InsertStmt) (*sqlx.Result, error) {
 }
 
 func (m *Manager) execUpdate(st *sqlx.UpdateStmt) (*sqlx.Result, error) {
-	return m.execWriteDML(st.Table, sqlx.StatementString(st), st.Where, "update")
+	return m.execWriteDML(st.Table, st, st.Where, "update")
 }
 
 func (m *Manager) execDelete(st *sqlx.DeleteStmt) (*sqlx.Result, error) {
-	return m.execWriteDML(st.Table, sqlx.StatementString(st), st.Where, "delete")
+	return m.execWriteDML(st.Table, st, st.Where, "delete")
 }
 
 // execWriteDML routes UPDATE/DELETE to one shard (if WHERE pins the PK) or
 // broadcasts to every shard of the table.
-func (m *Manager) execWriteDML(table, sql string, where sqlx.Expr, typ string) (*sqlx.Result, error) {
+func (m *Manager) execWriteDML(table string, st sqlx.Statement, where sqlx.Expr, typ string) (*sqlx.Result, error) {
 	ts := m.table(table)
 	if ts == nil {
 		return nil, notFound(table)
@@ -794,7 +849,7 @@ func (m *Manager) execWriteDML(table, sql string, where sqlx.Expr, typ string) (
 		targets = ts.Shards
 	}
 	for _, spec := range targets {
-		resp, err := m.execShardSQL(spec, sql)
+		resp, err := m.execShardSQLStmt(spec, st)
 		if err != nil {
 			return nil, err
 		}
@@ -806,6 +861,44 @@ func (m *Manager) execWriteDML(table, sql string, where sqlx.Expr, typ string) (
 		}
 	}
 	return &sqlx.Result{Type: typ, Affected: affected}, nil
+}
+
+// execShardSQLStmt executes an already-parsed shard-scoped DML via the shard's
+// leader, avoiding re-routing loops and the second SQL parse the text path
+// pays on the leader (the statement is shipped in binary form instead).
+func (m *Manager) execShardSQLStmt(spec *ShardSpec, st sqlx.Statement) (*proto.Response, error) {
+	if !m.hosts(spec) {
+		addr := m.livePlacementAddr(spec)
+		if addr == "" {
+			return nil, fmt.Errorf("shard %s has no live placement", spec.ID)
+		}
+		return m.remoteAdmin(addr, m.execShardEncCmd(spec.ID, st))
+	}
+	sh := m.localShard(spec.ID)
+	if sh == nil {
+		return nil, fmt.Errorf("shard %s not mounted locally", spec.ID)
+	}
+	if !sh.node.IsLeader() {
+		addr, err := m.shardLeaderSQLAddr(sh, 5*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		if addr != m.sqlAddr {
+			return m.remoteAdmin(addr, m.execShardEncCmd(spec.ID, st))
+		}
+		// we are the leader but the election just finished; fall through
+	}
+	r, err := sh.node.ExecuteStmt(st)
+	if err != nil {
+		return nil, err
+	}
+	return &proto.Response{OK: true, Result: payloadOf(r)}, nil
+}
+
+// execShardEncCmd builds the ADMIN EXEC-SHARD-ENC wire command for a statement.
+func (m *Manager) execShardEncCmd(shardID string, st sqlx.Statement) string {
+	raw := sqlx.EncodeStatements([]sqlx.Statement{st})
+	return "ADMIN EXEC-SHARD-ENC " + shardID + " " + base64.StdEncoding.EncodeToString(raw)
 }
 
 // execShardSQL executes a shard-scoped DML via the shard's leader, avoiding
@@ -1014,7 +1107,7 @@ func (m *Manager) execKVPut(st *sqlx.KVPutStmt) (*sqlx.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := m.execShardSQL(spec, sqlx.StatementString(st))
+	resp, err := m.execShardSQLStmt(spec, st)
 	if err != nil {
 		return nil, err
 	}
@@ -1029,7 +1122,7 @@ func (m *Manager) execKVDelete(st *sqlx.KVDeleteStmt) (*sqlx.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := m.execShardSQL(spec, sqlx.StatementString(st))
+	resp, err := m.execShardSQLStmt(spec, st)
 	if err != nil {
 		return nil, err
 	}
@@ -1044,7 +1137,7 @@ func (m *Manager) execKVGet(st *sqlx.KVGetStmt) (*sqlx.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := m.execShardSQL(spec, sqlx.StatementString(st))
+	resp, err := m.execShardSQLStmt(spec, st)
 	if err != nil {
 		return nil, err
 	}
@@ -1069,7 +1162,7 @@ func (m *Manager) execKVScan(st *sqlx.KVScanStmt) (*sqlx.Result, error) {
 		wg.Add(1)
 		go func(spec *ShardSpec) {
 			defer wg.Done()
-			resp, err := m.execShardSQL(spec, sqlx.StatementString(st))
+			resp, err := m.execShardSQLStmt(spec, st)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {

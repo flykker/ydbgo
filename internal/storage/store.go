@@ -29,6 +29,7 @@ type storeTx interface {
 	schemaNames() ([]string, error)
 	// rows, keyed by the encoded (sortable) primary key.
 	rowPut(table string, key []byte, val []byte) error
+	rowPutCells(table string, key []byte, cells [][]byte) error
 	rowGet(table string, key []byte) ([]byte, error)
 	rowDelete(table string, key []byte) error
 	rowEach(table string, fn func(k, v []byte) error) error

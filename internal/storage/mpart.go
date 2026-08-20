@@ -257,11 +257,25 @@ type mpartStore struct {
 	stopFlush chan struct{}
 	flushDone chan struct{}
 
+	// flushCh signals the background flusher to materialize a full mem part
+	// into an immutable on-disk part. A mem part that crosses the size
+	// threshold during a raft commit must NOT be flushed inline (that would
+	// stall the FSM goroutine on LZ4 + file writes); instead the commit swaps
+	// in a fresh mem part and hands the full one to the flusher worker.
+	flushCh chan flushJob
+
 	// preloadCh queues freshly flushed/merged parts whose dense columns should
 	// be decoded in the background before the first query touches them. The
 	// buffer is bounded; when full, the part is simply skipped (the query path
 	// still decodes lazily).
 	preloadCh chan *mpart
+}
+
+// flushJob is one full mem part handed to the background flusher.
+type flushJob struct {
+	tbl  string
+	rows []*memRow
+	id   int
 }
 
 // openMpart opens (creating if needed) an mpart store rooted at dir.
@@ -279,6 +293,7 @@ func openMpart(dir string) (*mpartStore, error) {
 		lastWrite: map[string]time.Time{},
 		stopFlush: make(chan struct{}),
 		flushDone: make(chan struct{}),
+		flushCh:   make(chan flushJob, 8),
 		preloadCh: make(chan *mpart, 16),
 	}
 	idMax := 0
@@ -328,7 +343,8 @@ func openMpart(dir string) (*mpartStore, error) {
 // trailing mem tail into an immutable part and merges overlapping parts
 // (ClickHouse background-merge analog). It observes the committed mem/parts
 // (only touched under s.mu), so it never races an in-flight commit. It exits
-// on Close.
+// on Close. It also drains flushCh, which carries full mem parts detached by
+// a commit that crossed the mem size threshold (async threshold flush).
 func (s *mpartStore) startIdleFlusher() {
 	go func() {
 		t := time.NewTicker(mpartIdleFlushInterval / 2)
@@ -338,6 +354,8 @@ func (s *mpartStore) startIdleFlusher() {
 			select {
 			case <-s.stopFlush:
 				return
+			case j := <-s.flushCh:
+				s.flushJobAsync(j)
 			case now := <-t.C:
 				s.flushIdle(now)
 				s.mergeIdle(now)
@@ -433,9 +451,11 @@ func (s *mpartStore) queuePreload(tbl string) {
 
 // flushIdle flushes every table whose mem part has not received a write for
 // mpartIdleFlushInterval and holds at least mpartIdleFlushMinRows rows.
+// The actual part write happens outside the store lock so a large trailing
+// mem part (bulk load) never stalls concurrent reads on s.mu.
 func (s *mpartStore) flushIdle(now time.Time) {
+	var jobs []flushJob
 	s.mu.Lock()
-	var flushed []string
 	for tbl, mp := range s.mem {
 		if mp == nil || len(mp.rows) < mpartIdleFlushMinRows {
 			continue
@@ -447,19 +467,46 @@ func (s *mpartStore) flushIdle(now time.Time) {
 		if now.Sub(last) < mpartIdleFlushInterval {
 			continue
 		}
-		if err := s.flushLocked(tbl); err != nil {
-			// Best-effort: reads are unaffected (mem still holds the rows);
-			// the next tick retries. Failure is only logged via the error
-			// return; callers with a logger may handle it.
-			_ = err
-		} else {
-			flushed = append(flushed, tbl)
+		rows := make([]*memRow, 0, len(mp.rows))
+		for _, r := range mp.rows {
+			rows = append(rows, r)
 		}
+		s.nextID++
+		s.mem[tbl] = &memPart{rows: map[string]*memRow{}}
+		s.lastWrite[tbl] = time.Now()
+		jobs = append(jobs, flushJob{tbl: tbl, rows: rows, id: s.nextID})
 	}
 	s.mu.Unlock()
-	for _, tbl := range flushed {
-		s.queuePreload(tbl)
+	for _, j := range jobs {
+		s.flushJobAsync(j)
 	}
+}
+
+// flushJobAsync writes a mem part (still resident in s.mem) to an immutable
+// part, outside the store lock so a large part never stalls reads or a raft
+// commit that is waiting on s.mu. Runs on the flusher worker. Rows stay
+// visible in mem until the part is sealed; the worker then removes from mem
+// only the row pointers it actually wrote (newer overwrites of the same PK
+// keep their pointer and stay in mem, winning the read merge), and publishes
+// the part. On write error the rows remain in mem untouched.
+func (s *mpartStore) flushJobAsync(j flushJob) {
+	sortMemRows(j.rows)
+	p, err := s.writePart(j.tbl, j.rows, j.id)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	for _, r := range j.rows {
+		if cur, ok := s.mem[j.tbl]; ok && cur != nil {
+			if cur.rows[string(r.pk)] == r {
+				delete(cur.rows, string(r.pk))
+			}
+		}
+	}
+	s.parts[j.tbl] = append(s.parts[j.tbl], p)
+	sortPartsBySeq(s.parts[j.tbl])
+	s.mu.Unlock()
+	s.queuePreload(j.tbl)
 }
 
 // liveCountLocked counts the distinct live rows of tbl across its on-disk
@@ -551,6 +598,34 @@ func (s *mpartStore) flush(tbl string) error {
 	return s.flushLocked(tbl)
 }
 
+// sortMemRows sorts rows by pk. Most PKs are a single int64 encoded as
+// [tInt, 0xff, 8-byte big-endian uint64]; those sort by comparing the tail
+// uint64 directly, which is far cheaper than bytes.Compare (especially under
+// the CPU contention of a 5-node dev cluster). Anything else falls back to
+// bytes.Compare on the full key.
+func sortRowsFastOK(rows []*memRow) bool {
+	for _, r := range rows {
+		// Single int64 PK: [tInt, 0xff, uint64 BE, 0xff] (encodeKey adds a
+		// 0xff terminator after every value).
+		if len(r.pk) != 11 || r.pk[0] != byte(tInt) || r.pk[1] != 0xff || r.pk[10] != 0xff {
+			return false
+		}
+	}
+	return true
+}
+
+func sortMemRows(rows []*memRow) {
+	if n := len(rows); n > 1 {
+		if fast := sortRowsFastOK(rows); fast {
+			sort.Slice(rows, func(i, j int) bool {
+				return binary.BigEndian.Uint64(rows[i].pk[2:10]) < binary.BigEndian.Uint64(rows[j].pk[2:10])
+			})
+			return
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].pk, rows[j].pk) < 0 })
+}
+
 // flushLocked writes the current mem part of tbl to a new immutable part and
 // resets the mem part. Live counts are unchanged (rows only moved).
 func (s *mpartStore) flushLocked(tbl string) error {
@@ -562,8 +637,9 @@ func (s *mpartStore) flushLocked(tbl string) error {
 	for _, r := range mp.rows {
 		rows = append(rows, r)
 	}
-	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].pk, rows[j].pk) < 0 })
-	p, err := s.writePart(tbl, rows)
+	sortMemRows(rows)
+	s.nextID++
+	p, err := s.writePart(tbl, rows, s.nextID)
 	if err != nil {
 		return err
 	}
@@ -576,9 +652,7 @@ func (s *mpartStore) flushLocked(tbl string) error {
 // writePart materializes a new immutable part from rows (already sorted by
 // pk) into the parts directory, writing column files first and meta.bin last
 // as the seal marker.
-func (s *mpartStore) writePart(tbl string, rows []*memRow) (*mpart, error) {
-	s.nextID++
-	id := s.nextID
+func (s *mpartStore) writePart(tbl string, rows []*memRow, id int) (*mpart, error) {
 	dir := filepath.Join(s.dir, mpartPartsDir, fmt.Sprintf("p%08d", id))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -1407,10 +1481,20 @@ func (p *mpart) loadColDense(colIdx int) (vals []int64, nulls []uint64, ok bool,
 		return nil, nil, false, nil
 	}
 	if p.denseOnce == nil {
-		p.denseOnce = make([]sync.Once, p.ncols)
-		p.denseVals = make([][]int64, p.ncols)
-		p.denseNulls = make([][]uint64, p.ncols)
-		p.denseErr = make([]error, p.ncols)
+		// Publish the backing arrays before denseOnce so a concurrent reader
+		// that observes denseOnce != nil can never see nil denseVals/denseNulls
+		// (which would panic inside the Once body). denseOnce is written last
+		// and acts as the readiness marker; unsynchronized readers still see a
+		// torn state only until denseOnce lands, and the Once body is guarded
+		// by denseOnce[colIdx] itself.
+		once := make([]sync.Once, p.ncols)
+		vals := make([][]int64, p.ncols)
+		nulls := make([][]uint64, p.ncols)
+		errs := make([]error, p.ncols)
+		p.denseVals = vals
+		p.denseNulls = nulls
+		p.denseErr = errs
+		p.denseOnce = once
 	}
 	p.denseOnce[colIdx].Do(func() {
 		if len(p.granules) > 0 {
@@ -1576,6 +1660,13 @@ func (t *mpartTx) rowPut(table string, key []byte, val []byte) error {
 		return err
 	}
 	_ = n
+	return t.rowPutCells(table, key, cells)
+}
+
+// rowPutCells buffers a row from already-decoded column cells, skipping the
+// encodeRow->splitRow round trip that rowPut performs for callers that only
+// have the encoded row blob.
+func (t *mpartTx) rowPutCells(table string, key []byte, cells [][]byte) error {
 	// A row that becomes live raises the table's count; overwriting a live row
 	// does not. The existence read goes through the overlay so repeated writes
 	// of one pk in a single tx are exact.
@@ -1616,11 +1707,63 @@ func (t *mpartTx) rowDelete(table string, key []byte) error {
 // rowExists reports whether key is live in the current view (overlay, mem or
 // any part), ignoring this tx's own tombstones.
 func (t *mpartTx) rowExists(table string, key []byte) (bool, error) {
-	_, del, found, err := t.lookup(table, key)
-	if err != nil {
-		return false, err
+	if ov := t.overlay[table]; ov != nil {
+		if r, ok := ov.rows[string(key)]; ok {
+			return !r.del, nil
+		}
 	}
-	return found && !del, nil
+	if t.cleared[table] {
+		return false, nil
+	}
+	parts, mem := t.committedView(table)
+	if mem != nil {
+		if r, ok := mem.rows[string(key)]; ok {
+			return !r.del, nil
+		}
+	}
+	// Newest part first, decoding only pk + tombstone bits of the containing
+	// granule: existence checks (UPSERT dedup) must not decompress every
+	// column's cells of a granule just to answer found&&!del.
+	for i := len(parts) - 1; i >= 0; i-- {
+		p := parts[i]
+		if bytes.Compare(key, p.pkMin) < 0 || bytes.Compare(key, p.pkMax) > 0 {
+			continue
+		}
+		if !p.bloom.mayContain(key) {
+			continue
+		}
+		if g := p.granuleFor(key); g >= 0 {
+			pks, err := p.loadGranulePks(g)
+			if err != nil {
+				return false, err
+			}
+			gi := sort.Search(len(pks), func(i int) bool { return bytes.Compare(pks[i], key) >= 0 })
+			if gi < len(pks) && bytes.Equal(pks[gi], key) {
+				dels, err := p.loadGranuleDels(g)
+				if err != nil {
+					return false, err
+				}
+				return !dels[gi], nil
+			}
+			continue
+		}
+		if len(p.granules) > 0 {
+			continue
+		}
+		pks, _, lerr := p.loadRows()
+		if lerr != nil {
+			return false, lerr
+		}
+		dels, derr := p.loadDels()
+		if derr != nil {
+			return false, derr
+		}
+		i := sort.Search(len(pks), func(i int) bool { return bytes.Compare(pks[i], key) >= 0 })
+		if i < len(pks) && bytes.Equal(pks[i], key) {
+			return !dels[i], nil
+		}
+	}
+	return false, nil
 }
 
 // lookup resolves key to its newest live-or-deleted row: overlay first, then
@@ -2422,14 +2565,41 @@ func walkGrouped(entries []srcRow, fn func(e srcRow) error) error {
 	return nil
 }
 
-// compactTable merges the table's mem + parts into fresh parts, dropping
-// tombstoned rows and superseded versions, and reclaims the old part files.
-// It returns the number of live rows after compaction.
+// compactTable merges the table's parts into fresh parts, dropping tombstoned
+// rows and superseded versions, and reclaims the old part files. It returns
+// the number of live rows after compaction.
+//
+// The heavy work (reading the immutable parts and writing the fresh ones)
+// happens WITHOUT the store lock: parts are immutable once written, so a
+// large compaction never stalls concurrent reads on s.mu. The swap at the end
+// is atomic under the lock.
 func (s *mpartStore) compactTable(tbl string) (int64, error) {
+	// Phase 1 (under lock): snapshot the parts to merge and the mem rows.
+	// Memory rows are kept by pointer so the final swap can drop exactly the
+	// rows that were folded into the fresh parts (any row overwritten by a
+	// commit during the merge has a different pointer and is preserved).
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	t := &mpartTx{s: s, overlay: map[string]*memPart{}}
-	entries, err := t.collectEntriesLocked(tbl, -1, true, nil, nil)
+	oldParts := append([]*mpart(nil), s.parts[tbl]...)
+	mem := s.mem[tbl]
+	oldCount := s.counts[tbl]
+	memRows := map[string]*memRow{}
+	memSnap := &memPart{rows: memRows}
+	if mem != nil {
+		for k, r := range mem.rows {
+			memRows[k] = r
+		}
+	}
+	s.mu.Unlock()
+
+	// Phase 2 (no lock): read the snapshot parts + mem, resolve newest-wins,
+	// and write the fresh parts. The snapshot tx never takes s.mu (parts are
+	// immutable; the mem rows are frozen copies by pointer).
+	t := &mpartTx{s: s, snap: true,
+		snapParts: map[string][]*mpart{tbl: oldParts},
+		snapMem:   map[string]*memPart{tbl: memSnap},
+		snapCount: map[string]int64{tbl: oldCount},
+	}
+	entries, err := t.collectEntries(tbl, -1, true, nil, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -2444,28 +2614,56 @@ func (s *mpartStore) compactTable(tbl string) (int64, error) {
 		}
 		i++
 	}
-	// Rewrite in flush-sized chunks so compaction of a large table stays
-	// bounded in memory.
-	for _, p := range s.parts[tbl] {
-		s.retirePart(p)
-	}
-	s.parts[tbl] = nil
-	s.mem[tbl] = nil
-	s.counts[tbl] = 0
-	for start := 0; start < len(rows); start += mpartMergeChunk {
-		end := start + mpartMergeChunk
-		if end > len(rows) {
-			end = len(rows)
+	// Reserve a contiguous id range under the lock so concurrent flushes can't
+	// collide, then write the chunks outside it.
+	nchunks := (len(rows) + mpartMergeChunk - 1) / mpartMergeChunk
+	s.mu.Lock()
+	startID := s.nextID + 1
+	s.nextID += nchunks
+	s.mu.Unlock()
+	newParts := make([]*mpart, 0, nchunks)
+	for i := 0; i < nchunks; i++ {
+		a := i * mpartMergeChunk
+		b := a + mpartMergeChunk
+		if b > len(rows) {
+			b = len(rows)
 		}
-		p, err := s.writePart(tbl, rows[start:end])
+		p, err := s.writePart(tbl, rows[a:b], startID+i)
 		if err != nil {
 			return 0, err
 		}
-		s.parts[tbl] = append(s.parts[tbl], p)
+		newParts = append(newParts, p)
 	}
+
+	// Phase 3 (under lock): atomically swap the fresh parts in, drop the old
+	// ones, and adjust the live count for commits that landed mid-merge.
+	s.mu.Lock()
+	delta := s.counts[tbl] - oldCount
+	if cur := s.mem[tbl]; cur != nil {
+		for k, r := range memRows {
+			if cur.rows[k] == r {
+				delete(cur.rows, k)
+			}
+		}
+	}
+	oldSet := make(map[*mpart]bool, len(oldParts))
+	for _, p := range oldParts {
+		oldSet[p] = true
+	}
+	kept := make([]*mpart, 0, len(s.parts[tbl]))
+	for _, p := range s.parts[tbl] {
+		if !oldSet[p] {
+			kept = append(kept, p)
+		}
+	}
+	s.parts[tbl] = append(kept, newParts...)
 	sortPartsBySeq(s.parts[tbl])
-	s.counts[tbl] = int64(len(rows))
-	return int64(len(rows)), nil
+	s.counts[tbl] = int64(len(rows)) + delta
+	for _, p := range oldParts {
+		s.retirePart(p)
+	}
+	s.mu.Unlock()
+	return s.counts[tbl], nil
 }
 
 // --- frame + compression helpers ---

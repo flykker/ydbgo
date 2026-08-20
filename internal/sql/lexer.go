@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -172,14 +173,14 @@ func (l *lexer) lexNumber() (token, error) {
 	text := l.src[start:l.pos]
 	t := token{kind: tokNumber, text: text, pos: start, isFloat: isFloat}
 	if isFloat {
-		var f float64
-		if _, err := fmt.Sscanf(text, "%g", &f); err != nil {
+		f, err := strconv.ParseFloat(text, 64)
+		if err != nil {
 			return t, fmt.Errorf("bad number %q", text)
 		}
 		t.fltVal = f
 	} else {
-		var i int64
-		if _, err := fmt.Sscanf(text, "%d", &i); err != nil {
+		i, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
 			return t, fmt.Errorf("bad integer %q", text)
 		}
 		t.intVal = i

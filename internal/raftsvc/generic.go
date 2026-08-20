@@ -2,12 +2,65 @@ package raftsvc
 
 import (
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/hashicorp/raft"
 )
+
+// noDelayStreamLayer is a raft.StreamLayer over plain TCP that enables
+// TCP_NODELAY on every accepted and dialed connection. hashicorp/raft leaves
+// Nagle on by default, which inflates each small AppendEntries round trip by
+// up to 40ms on loopback (and on LANs with Nagle) — exactly the traffic a
+// high-rate group-commit write path produces.
+type noDelayStreamLayer struct {
+	advertise net.Addr
+	listener  *net.TCPListener
+}
+
+func (l *noDelayStreamLayer) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
+	c, err := net.DialTimeout("tcp", string(address), timeout)
+	if err != nil {
+		return nil, err
+	}
+	if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+	return c, nil
+}
+
+func (l *noDelayStreamLayer) Accept() (net.Conn, error) {
+	c, err := l.listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+	return c, nil
+}
+
+func (l *noDelayStreamLayer) Close() error { return l.listener.Close() }
+
+func (l *noDelayStreamLayer) Addr() net.Addr {
+	if l.advertise != nil {
+		return l.advertise
+	}
+	return l.listener.Addr()
+}
+
+// newNoDelayTransport builds a raft network transport whose connections all
+// run with TCP_NODELAY enabled.
+func newNoDelayTransport(addr string, advertise net.Addr, timeout time.Duration) (*raft.NetworkTransport, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	stream := &noDelayStreamLayer{advertise: advertise, listener: ln.(*net.TCPListener)}
+	return raft.NewNetworkTransport(stream, 3, timeout, nil), nil
+}
 
 // Group is a generic Raft group: a transport, stores and a leader-election
 // lifecycle. It is the shared core for both the meta/catalog group and the
@@ -36,10 +89,10 @@ func NewGroup(id, raftAddr, dir string, fsm raft.FSM) *Group {
 func (g *Group) Start(bootstrap bool, peers []raft.Server) error {
 	conf := raft.DefaultConfig()
 	conf.LocalID = raft.ServerID(g.id)
-	conf.SnapshotInterval = 30 * time.Second
-	conf.SnapshotThreshold = 1000
+	conf.SnapshotInterval = 5 * time.Minute
+	conf.SnapshotThreshold = 100000
 
-	advertise, err := raft.NewTCPTransport(g.addr, nil, 3, 5*time.Second, nil)
+	advertise, err := newNoDelayTransport(g.addr, nil, 5*time.Second)
 	if err != nil {
 		return err
 	}
@@ -122,7 +175,7 @@ func (g *Group) LeaderAddr() string {
 	if g.raft == nil {
 		return ""
 	}
-	_, addr := g.raft.LeaderWithID()
+	addr, _ := g.raft.LeaderWithID()
 	return string(addr)
 }
 
@@ -131,7 +184,7 @@ func (g *Group) LeaderID() string {
 	if g.raft == nil {
 		return ""
 	}
-	id, _ := g.raft.LeaderWithID()
+	_, id := g.raft.LeaderWithID()
 	return string(id)
 }
 

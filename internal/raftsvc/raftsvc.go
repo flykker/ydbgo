@@ -202,21 +202,23 @@ func (n *Node) Execute(sql string) (*sqlx.Result, error) {
 	}
 	var last *sqlx.Result
 	for _, st := range stmts {
-		if isRead(st) {
-			r, err := n.exec.Execute(st)
-			if err != nil {
-				return nil, err
-			}
-			last = r
-			continue
-		}
-		r, err := n.submitOne(st)
+		r, err := n.ExecuteStmt(st)
 		if err != nil {
 			return nil, err
 		}
 		last = r
 	}
 	return last, nil
+}
+
+// ExecuteStmt applies an already-parsed statement, skipping the SQL text
+// re-parse that Execute pays for every shard-forwarded write. Writes still go
+// through Raft; reads run locally.
+func (n *Node) ExecuteStmt(st sqlx.Statement) (*sqlx.Result, error) {
+	if isRead(st) {
+		return n.exec.Execute(st)
+	}
+	return n.submitOne(st)
 }
 
 func (n *Node) IsLeader() bool { return n.group.IsLeader() }

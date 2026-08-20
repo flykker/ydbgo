@@ -234,6 +234,10 @@ func (t *pebbleTx) rowPut(table string, key []byte, val []byte) error {
 	return t.put(rowKey(table, key), val)
 }
 
+func (t *pebbleTx) rowPutCells(table string, key []byte, cells [][]byte) error {
+	return t.put(rowKey(table, key), joinRow(cells))
+}
+
 func (t *pebbleTx) rowGet(table string, key []byte) ([]byte, error) {
 	return t.get(rowKey(table, key))
 }

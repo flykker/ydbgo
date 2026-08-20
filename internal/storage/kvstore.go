@@ -254,6 +254,10 @@ func (t *kvTx) rowPut(table string, key []byte, val []byte) error {
 	t.put(kvRowKey(table, key), val)
 	return nil
 }
+func (t *kvTx) rowPutCells(table string, key []byte, cells [][]byte) error {
+	t.put(kvRowKey(table, key), joinRow(cells))
+	return nil
+}
 func (t *kvTx) rowGet(table string, key []byte) ([]byte, error) {
 	return t.get(kvRowKey(table, key))
 }

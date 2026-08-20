@@ -414,7 +414,9 @@ func (m *Manager) forwardToLeaderSQL(req *proto.Request, sql string) *proto.Resp
 	if err != nil {
 		return fail(req, err)
 	}
-	resp.ID = req.ID
+	if req != nil {
+		resp.ID = req.ID
+	}
 	return resp
 }
 
