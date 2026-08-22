@@ -102,6 +102,11 @@ type memRow struct {
 }
 
 type memPart struct {
+	// mu guards rows/hint/caches. It is a leaf lock: holders must not call
+	// anything that acquires the store lock. Lock ordering is always
+	// s.mu -> mp.mu. Readers of rows/cache fields outside the store lock
+	// (view-path column decodes) take mp.mu directly.
+	mu   sync.Mutex
 	rows map[string]*memRow
 
 	// Sorted-view cache. memRow is immutable once created and rows are only
@@ -125,6 +130,12 @@ type memPart struct {
 	// length match and the hint is ignored. Lets flush/ensureCached skip the
 	// O(n log n) sort.
 	hint []*memRow
+
+	// sealing marks a mem part handed to the background flusher: commit must
+	// not hand it off twice while the worker is sealing it. New rows may still
+	// fold into the part during the seal window; the worker removes only the
+	// pointers it actually wrote and then clears the flag.
+	sealing bool
 }
 
 // mpartGranule is one sparse-index entry: the granule's PK window (pkMax) and
@@ -203,10 +214,14 @@ type mpart struct {
 	// dense caches the decoded fixed-width numeric column values (one int64
 	// per row) plus a null bitmap, parallel to cols. Only used for dense
 	// columns; populated once per part because parts are immutable.
-	denseOnce  []sync.Once
-	denseVals  [][]int64
-	denseNulls [][]uint64
-	denseErr   []error
+	// denseInitMu guards the one-time lazy allocation of the arrays below
+	// (two preload workers can race the nil check otherwise); per-column
+	// decode itself is serialized by denseOnce.
+	denseInitMu sync.Mutex
+	denseOnce   []sync.Once
+	denseVals   [][]int64
+	denseNulls  [][]uint64
+	denseErr    []error
 
 	// Per-granule decode caches (v4 parts). Granule blocks are immutable, so
 	// repeated point reads / ORDER BY ... LIMIT / UPDATE row reads on the same
@@ -291,9 +306,11 @@ type mpartStore struct {
 
 // flushJob is one full mem part handed to the background flusher.
 type flushJob struct {
-	tbl  string
-	rows []*memRow
-	id   int
+	tbl    string
+	mp     *memPart // the part the rows came from (sealing flag owner)
+	rows   []*memRow
+	id     int
+	sorted bool // rows already in ascending PK order (writer hint); skip sorting
 }
 
 // openMpart opens (creating if needed) an mpart store rooted at dir.
@@ -478,7 +495,7 @@ func (s *mpartStore) flushIdle(now time.Time) {
 	var jobs []flushJob
 	s.mu.Lock()
 	for tbl, mp := range s.mem {
-		if mp == nil || len(mp.rows) < mpartIdleFlushMinRows {
+		if mp == nil || mp.sealing || len(mp.rows) < mpartIdleFlushMinRows {
 			continue
 		}
 		last, ok := s.lastWrite[tbl]
@@ -488,14 +505,21 @@ func (s *mpartStore) flushIdle(now time.Time) {
 		if now.Sub(last) < mpartIdleFlushInterval {
 			continue
 		}
+		mp.mu.Lock()
 		rows := make([]*memRow, 0, len(mp.rows))
 		for _, r := range mp.rows {
 			rows = append(rows, r)
 		}
+		mp.mu.Unlock()
 		s.nextID++
-		s.mem[tbl] = &memPart{rows: map[string]*memRow{}}
+		// Keep the part resident as s.mem[tbl]: rows must stay visible to
+		// readers until the worker seals the on-disk part (swapping in a
+		// fresh empty part here would open a read gap for the whole seal
+		// window). The worker removes exactly the pointers it wrote and
+		// clears the sealing flag.
+		mp.sealing = true
 		s.lastWrite[tbl] = time.Now()
-		jobs = append(jobs, flushJob{tbl: tbl, rows: rows, id: s.nextID})
+		jobs = append(jobs, flushJob{tbl: tbl, mp: mp, rows: rows, id: s.nextID})
 	}
 	s.mu.Unlock()
 	for _, j := range jobs {
@@ -511,23 +535,37 @@ func (s *mpartStore) flushIdle(now time.Time) {
 // keep their pointer and stay in mem, winning the read merge), and publishes
 // the part. On write error the rows remain in mem untouched.
 func (s *mpartStore) flushJobAsync(j flushJob) {
-	sortMemRows(j.rows)
-	p, err := s.writePart(j.tbl, j.rows, j.id)
-	if err != nil {
-		return
+	if !j.sorted {
+		sortMemRows(j.rows)
 	}
+	p, err := s.writePart(j.tbl, j.rows, j.id)
 	s.mu.Lock()
-	for _, r := range j.rows {
-		if cur, ok := s.mem[j.tbl]; ok && cur != nil {
-			if cur.rows[string(r.pk)] == r {
-				delete(cur.rows, string(r.pk))
+	if cur := s.mem[j.tbl]; cur == j.mp {
+		cur.mu.Lock()
+		if err == nil {
+			// Remove exactly the row pointers this job wrote (under both store
+			// and part locks, so unlocked readers synchronize correctly). A
+			// newer overwrite of the same PK keeps its own pointer and stays
+			// in mem, winning the read merge.
+			for _, r := range j.rows {
+				if cur.rows[string(r.pk)] == r {
+					delete(cur.rows, string(r.pk))
+				}
 			}
 		}
+		// Re-arm threshold flushes no matter how the write ended: rows folded
+		// during the seal window stay in mem either way.
+		cur.sealing = false
+		cur.mu.Unlock()
 	}
-	s.parts[j.tbl] = append(s.parts[j.tbl], p)
-	sortPartsBySeq(s.parts[j.tbl])
+	if err == nil {
+		s.parts[j.tbl] = append(s.parts[j.tbl], p)
+		sortPartsBySeq(s.parts[j.tbl])
+	}
 	s.mu.Unlock()
-	s.queuePreload(j.tbl)
+	if err == nil {
+		s.queuePreload(j.tbl)
+	}
 }
 
 // liveCountLocked counts the distinct live rows of tbl across its on-disk
@@ -596,9 +634,11 @@ func (s *mpartStore) snapshot() (storeTx, error) {
 			continue
 		}
 		m := &memPart{rows: make(map[string]*memRow, len(mp.rows))}
+		mp.mu.Lock()
 		for k, r := range mp.rows {
 			m.rows[k] = r
 		}
+		mp.mu.Unlock()
 		frozen[tbl] = m
 	}
 	parts := make(map[string][]*mpart, len(s.parts))
@@ -667,6 +707,7 @@ func (s *mpartStore) flushLocked(tbl string) error {
 	if mp == nil || len(mp.rows) == 0 {
 		return nil
 	}
+	mp.mu.Lock()
 	rows := mp.hint
 	if len(rows) != len(mp.rows) || !memRowsSorted(rows) {
 		rows = make([]*memRow, 0, len(mp.rows))
@@ -677,6 +718,7 @@ func (s *mpartStore) flushLocked(tbl string) error {
 			sortMemRows(rows)
 		}
 	}
+	mp.mu.Unlock()
 	sortDur := time.Since(t0)
 	t1 := time.Now()
 	s.nextID++
@@ -1529,13 +1571,8 @@ func (p *mpart) loadColDense(colIdx int) (vals []int64, nulls []uint64, ok bool,
 	if _, dense := colFmtType(p.colFmts[colIdx]); !dense {
 		return nil, nil, false, nil
 	}
+	p.denseInitMu.Lock()
 	if p.denseOnce == nil {
-		// Publish the backing arrays before denseOnce so a concurrent reader
-		// that observes denseOnce != nil can never see nil denseVals/denseNulls
-		// (which would panic inside the Once body). denseOnce is written last
-		// and acts as the readiness marker; unsynchronized readers still see a
-		// torn state only until denseOnce lands, and the Once body is guarded
-		// by denseOnce[colIdx] itself.
 		once := make([]sync.Once, p.ncols)
 		vals := make([][]int64, p.ncols)
 		nulls := make([][]uint64, p.ncols)
@@ -1545,7 +1582,9 @@ func (p *mpart) loadColDense(colIdx int) (vals []int64, nulls []uint64, ok bool,
 		p.denseErr = errs
 		p.denseOnce = once
 	}
-	p.denseOnce[colIdx].Do(func() {
+	once := p.denseOnce
+	p.denseInitMu.Unlock()
+	once[colIdx].Do(func() {
 		if len(p.granules) > 0 {
 			// v4 part: decode each granule's dense block and concatenate. The
 			// blocks are independently compressed, so they decode in parallel;
@@ -1785,9 +1824,24 @@ func (t *mpartTx) rowExists(table string, key []byte) (bool, error) {
 	if t.cleared[table] {
 		return false, nil
 	}
-	parts, mem := t.committedView(table)
+	// Hold the store lock while reading mem/parts contents: committedView
+	// only guards fetching the references, and the flusher worker mutates a
+	// resident mem part's rows map when it seals it (pointer removal after
+	// publish). Part loaders below are cache-level syncs safe under s.mu.
+	var parts []*mpart
+	var mem *memPart
+	if t.snap {
+		parts, mem = t.snapParts[table], t.snapMem[table]
+	} else {
+		t.s.mu.Lock()
+		defer t.s.mu.Unlock()
+		parts, mem = t.s.parts[table], t.s.mem[table]
+	}
 	if mem != nil {
-		if r, ok := mem.rows[string(key)]; ok {
+		mem.mu.Lock()
+		r, ok := mem.rows[string(key)]
+		mem.mu.Unlock()
+		if ok {
 			return !r.del, nil
 		}
 	}
@@ -1857,9 +1911,22 @@ func (t *mpartTx) lookup(table string, key []byte) (cells [][]byte, del, found b
 		}
 		return nil, false, false, nil
 	}
-	parts, mem := t.committedView(table)
+	// Same locking discipline as rowExists: read mem/parts contents under the
+	// store lock (the worker mutates a sealing mem part's rows on publish).
+	var parts []*mpart
+	var mem *memPart
+	if t.snap {
+		parts, mem = t.snapParts[table], t.snapMem[table]
+	} else {
+		t.s.mu.Lock()
+		defer t.s.mu.Unlock()
+		parts, mem = t.s.parts[table], t.s.mem[table]
+	}
 	if mem != nil {
-		if r, ok := mem.rows[string(key)]; ok {
+		mem.mu.Lock()
+		r, ok := mem.rows[string(key)]
+		mem.mu.Unlock()
+		if ok {
 			if r.del {
 				if found {
 					return cells, false, true, nil
@@ -1998,9 +2065,22 @@ func (t *mpartTx) lookupCol(table string, colIdx int, key []byte) ([]byte, error
 	if t.cleared[table] {
 		return nil, nil
 	}
-	parts, mem := t.committedView(table)
+	// Same locking discipline as rowExists: read mem/parts contents under the
+	// store lock (the worker mutates a sealing mem part's rows on publish).
+	var parts []*mpart
+	var mem *memPart
+	if t.snap {
+		parts, mem = t.snapParts[table], t.snapMem[table]
+	} else {
+		t.s.mu.Lock()
+		defer t.s.mu.Unlock()
+		parts, mem = t.s.parts[table], t.s.mem[table]
+	}
 	if mem != nil {
-		if r, ok := mem.rows[string(key)]; ok {
+		mem.mu.Lock()
+		r, ok := mem.rows[string(key)]
+		mem.mu.Unlock()
+		if ok {
 			if r.del {
 				return nil, nil
 			}
@@ -2130,6 +2210,9 @@ func (t *mpartTx) commit() error {
 			s.mem[tbl] = cur
 		}
 		t0 := time.Now()
+		// Fold under the target part's own leaf lock: unlocked readers of a
+		// resident mem part (column-decode view paths) synchronize on mp.mu.
+		cur.mu.Lock()
 		foldedIntoEmpty := len(cur.rows) == 0
 		for k, r := range mp.rows {
 			// CH partial-merge: an overlay row may be partial (empty cells for
@@ -2158,16 +2241,28 @@ func (t *mpartTx) commit() error {
 		cur.gen++
 		s.lastWrite[tbl] = time.Now()
 		foldDur := time.Since(t0)
+
+		// Threshold flush stays synchronous: handing the part to the flusher
+		// worker measured slower end-to-end (the worker's publish contends
+		// with the next apply for s.mu/mp.mu and GC cycles), and raft already
+		// owns durability. Idle-flush jobs below still go through the worker.
+		// The part lock must be released first: flushLocked collects rows
+		// under mp.mu itself.
 		if len(cur.rows) >= mpartFlushThreshold {
 			t1 := time.Now()
-			if err := s.flushLocked(tbl); err != nil {
-				return err
+			cur.mu.Unlock()
+			ferr := s.flushLocked(tbl)
+			if ferr != nil {
+				return ferr
 			}
 			if d := time.Since(t1); d > 150*time.Millisecond || foldDur > 150*time.Millisecond {
 				log.Printf("MPART-COMMIT-SLOW: fold %v flush %v (%d rows)", foldDur, d, len(cur.rows))
 			}
-		} else if foldDur > 150*time.Millisecond {
-			log.Printf("MPART-COMMIT-SLOW: fold %v (no flush)", foldDur)
+		} else {
+			cur.mu.Unlock()
+			if foldDur > 150*time.Millisecond {
+				log.Printf("MPART-COMMIT-SLOW: fold %v (no flush)", foldDur)
+			}
 		}
 	}
 	for tbl, d := range t.deltas {
@@ -2351,11 +2446,16 @@ func coveringNewestSource(srcs []*mergeSrc, plLower, plUpper []byte) *mergeSrc {
 	return s
 }
 
+// mapRows reports the live row count of a mem part. The map length is read
+// under the part's own lock so it cannot race the fold/publish swaps.
 func mapRows(mp *memPart) int {
 	if mp == nil {
 		return 0
 	}
-	return len(mp.rows)
+	mp.mu.Lock()
+	n := len(mp.rows)
+	mp.mu.Unlock()
+	return n
 }
 
 // walkMergedLocked streams the table's rows inside [plLower, plUpper) in PK
@@ -2674,7 +2774,8 @@ func addRowSource(h *mergeHeap, rows map[string]*memRow, colIdx int, full bool, 
 // ensureCached builds (or reuses) the mem part's pk-sorted view. Mem rows are
 // immutable and only commit() appends, so a view built at gen stays valid until
 // the next commit bumps gen.
-func (mp *memPart) ensureCached() {
+// ensureCachedLocked builds the sorted cache view. Caller holds mp.mu.
+func (mp *memPart) ensureCachedLocked() {
 	if mp.gen == mp.cacheGen && mp.cacheRows != nil {
 		return
 	}
@@ -2704,6 +2805,12 @@ func (mp *memPart) ensureCached() {
 	mp.cacheGen = mp.gen
 }
 
+func (mp *memPart) ensureCached() {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	mp.ensureCachedLocked()
+}
+
 // addMemSource builds a pk-sorted source run from a mem part, reusing the
 // cached decoded view when the mem part has not changed since it was built
 // (mem rows are immutable; only commit() appends to the map, bumping gen).
@@ -2711,7 +2818,8 @@ func (mp *memPart) ensureCached() {
 // insert buffer: a stable trailing tail costs one sort + one cell pass instead
 // of re-doing both on every read.
 func addMemSource(h *mergeHeap, mp *memPart, colIdx int, full bool, rev bool, plLower, plUpper []byte) error {
-	mp.ensureCached()
+	mp.mu.Lock()
+	mp.ensureCachedLocked()
 	var cells [][]byte
 	var fulls [][][]byte
 	if full {
@@ -2738,6 +2846,7 @@ func addMemSource(h *mergeHeap, mp *memPart, colIdx int, full bool, rev bool, pl
 		cells = c
 	}
 	pks, dels := mp.cachePks, mp.cacheDels
+	mp.mu.Unlock()
 	lo, hi := sliceRange(pks, plLower, plUpper)
 	if lo >= hi {
 		return nil

@@ -932,21 +932,22 @@ func TestMpartPreloadDense(t *testing.T) {
 	ms.lastWrite["g"] = time.Now().Add(-2 * mpartIdleFlushInterval)
 	ms.mu.Unlock()
 	ms.flushIdle(time.Now())
-	// Wait for the prefetch worker to drain the queue. denseVals is written
-	// before the part is published to the preload channel and loadColDense
-	// sync.Once makes the write visible to subsequent readers.
+	// Wait for the prefetch worker to drain the queue. loadColDense is the
+	// synchronization point: it blocks on the per-column sync.Once until the
+	// prefetcher's decode lands, then returns the cached values.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		ms.mu.Lock()
 		parts := append([]*mpart(nil), ms.parts["g"]...)
+		ms.mu.Unlock()
 		done := true
 		for _, p := range parts {
-			if p.denseVals == nil || len(p.denseVals) == 0 || len(p.denseVals[0]) == 0 {
+			vals, _, ok, err := p.loadColDense(0)
+			if err != nil || !ok || len(vals) == 0 {
 				done = false
 				break
 			}
 		}
-		ms.mu.Unlock()
 		if done || len(parts) == 0 {
 			break
 		}

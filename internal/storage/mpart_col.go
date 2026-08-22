@@ -191,7 +191,7 @@ func (t *mpartTx) colDecodeNumericFiltered(table string, colIdx int, typ sqlType
 	if t.cleared[table] || t.overlay[table] != nil {
 		return t.colDecodeNumeric(table, colIdx, typ, plLower, plUpper)
 	}
-	parts, mem := t.committedViewLocked(table)
+	parts, mem := t.committedRefs(table)
 	zoning := true
 	sorted := append([]*mpart(nil), parts...)
 	sort.Slice(sorted, func(i, j int) bool { return bytes.Compare(sorted[i].pkMin, sorted[j].pkMin) < 0 })
@@ -266,8 +266,10 @@ func (t *mpartTx) colDecodeNumericFiltered(table string, colIdx int, typ sqlType
 	if mem != nil && mapRows(mem) > 0 {
 		// The mem tail is not covered by zones (still in flight); decode it
 		// through the plain walk and append its (already live) rows.
-		mem.ensureCached()
+		mem.mu.Lock()
+		mem.ensureCachedLocked()
 		rows := mem.cacheRows
+		mem.mu.Unlock()
 		if len(rows) > 0 {
 			for _, r := range rows {
 				if r.del || colIdx >= len(r.cells) {
@@ -303,10 +305,26 @@ func (t *mpartTx) colDecodeNumericFiltered(table string, colIdx int, typ sqlType
 // only: every part's column dense, pairwise-disjoint PK windows, no
 // tombstones, no NULL bits and no overlapping mem tail. Returns (vec, true)
 // when it fully decoded the column. This is the SUM/GROUP hot path after an
+// committedRefs returns the committed parts/mem references for tbl. The fetch
+// itself is synchronized against publish-time appends to the parts slice and
+// mem swaps; contents read afterwards are safe (parts are immutable and their
+// caches use per-part syncs, mem rows are only mutated under the same lock).
+// Callers that iterate a resident mem part's rows map directly must instead
+// hold the store lock across the whole read (see rowExists/lookup).
+func (t *mpartTx) committedRefs(tbl string) ([]*mpart, *memPart) {
+	if t.snap {
+		return t.snapParts[tbl], t.snapMem[tbl]
+	}
+	t.s.mu.Lock()
+	parts, mem := t.s.parts[tbl], t.s.mem[tbl]
+	t.s.mu.Unlock()
+	return parts, mem
+}
+
 // idle merge (single part): one bulk append per part instead of a per-row
 // callback.
 func (t *mpartTx) denseNumericFast(table string, colIdx int, typ sqlType) (*numVec, bool) {
-	parts, mem := t.committedViewLocked(table)
+	parts, mem := t.committedRefs(table)
 	for _, p := range parts {
 		if colIdx >= len(p.colFmts) {
 			return nil, false
@@ -323,8 +341,10 @@ func (t *mpartTx) denseNumericFast(table string, colIdx int, typ sqlType) (*numV
 	}
 	var memRows []*memRow
 	if mem != nil && mapRows(mem) > 0 {
-		mem.ensureCached()
+		mem.mu.Lock()
+		mem.ensureCachedLocked()
 		memRows = mem.cacheRows
+		mem.mu.Unlock()
 		if len(memRows) > 0 && len(parts) > 0 && bytes.Compare(memRows[0].pk, parts[len(parts)-1].pkMax) <= 0 {
 			return nil, false
 		}
@@ -454,6 +474,12 @@ func (t *mpartTx) walkMergedNumeric(table string, colIdx int, typ sqlType, plLow
 // Deleted rows are skipped; the live-row count stays untouched
 // (rowPutCellsNoCount), since every key comes from the live data itself.
 func (t *mpartTx) updateConstRange(table string, cells [][]byte, plLower, plUpper []byte) (int64, error) {
+	// walkMergedLocked requires the store lock (the "Locked" suffix); snapshot
+	// txs read frozen copies and skip it, same as walkMergedNumeric.
+	if !t.snap {
+		t.s.mu.Lock()
+		defer t.s.mu.Unlock()
+	}
 	var affected int64
 	err := t.walkMergedLocked(table, -1, false, false, plLower, plUpper, func(pk []byte, _ []byte, _ [][]byte, del bool) error {
 		if del {
@@ -493,8 +519,10 @@ func (t *mpartTx) fastNumericParts(table string, parts []*mpart, mem *memPart, c
 	// part's PK window (the bench shape: trailing rows before an idle flush).
 	var memRows []*memRow
 	if mem != nil && mapRows(mem) > 0 {
-		mem.ensureCached()
+		mem.mu.Lock()
+		mem.ensureCachedLocked()
 		memRows = mem.cacheRows
+		mem.mu.Unlock()
 		if len(memRows) > 0 {
 			if len(parts) > 0 {
 				if bytes.Compare(memRows[0].pk, parts[len(parts)-1].pkMax) <= 0 {
@@ -772,6 +800,8 @@ func walkSourceNumeric(s *mergeSrc, typ sqlType, fn func(pk []byte, val int64, n
 // the column's cells once per query (the mem tail is small; parts carry the
 // bulk).
 func addMemNumericSource(h *mergeHeap, mp *memPart, colIdx int, typ sqlType, plLower, plUpper []byte) error {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
 	var rs []*memRow
 	for _, r := range mp.rows {
 		if inPKRange(r.pk, plLower, plUpper) {
