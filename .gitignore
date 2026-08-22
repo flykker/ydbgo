@@ -16,3 +16,6 @@
 # OS / editor
 .DS_Store
 *.swp
+# reference sources (ClickHouse, YDB)
+/source/
+*.test

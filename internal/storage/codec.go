@@ -146,6 +146,45 @@ func (b *builder) Variant(v sqlValue) {
 }
 func (b *builder) Bytes() []byte { return b.buf }
 
+// appendVariant encodes one variant cell straight into buf, skipping the
+// per-cell builder allocation. Batch writers carve every cell out of one
+// growing scratch buffer this way (~1 alloc per batch instead of ~2 per cell).
+// Callers must treat returned subslices as immutable and never append to them
+// (three-index slicing below enforces that).
+func appendVariant(buf []byte, v sqlValue) []byte {
+	buf = append(buf, byte(v.typ))
+	if v.null {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
+	switch v.typ {
+	case tInt:
+		buf = appendVar(buf, v.i)
+	case tFloat:
+		buf = appendVar(buf, int64(math.Float64bits(v.f)))
+	case tString:
+		buf = appendVar(buf, int64(len(v.s)))
+		buf = append(buf, v.s...)
+	case tBool:
+		if v.b {
+			buf = append(buf, 1)
+		} else {
+			buf = append(buf, 0)
+		}
+	case tTimestamp:
+		buf = appendVar(buf, v.i)
+	}
+	return buf
+}
+
+func appendVar(buf []byte, v int64) []byte {
+	u := uint64(v)<<1 ^ uint64(v>>63)
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], u)
+	return append(buf, tmp[:n]...)
+}
+
 // decodeNumericCell decodes a cell of a known numeric type directly from its
 // raw bytes, skipping the generic reader allocation. Cell layout is
 // [type][null][zigzag varint]. Returns the value as (intVal, floatVal), whether

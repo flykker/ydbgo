@@ -190,6 +190,20 @@ t0=$(date +%s%N); ch_null "SELECT v FROM qa5.t_all WHERE id = 42"; echo "  point
 
 if [ "$CNT" != "$((STMT*ROWS))" ]; then fail "ClickHouse COUNT=$CNT, want $((STMT*ROWS))"; fi
 
+say "UPDATE/DELETE mutations via replica ch1 (compare with updel bench; Distributed does not support mutations)"
+MUT_START=$(date +%s%N)
+run_ch "ALTER TABLE qa5.t UPDATE g = 7 WHERE id = 42 SETTINGS mutations_sync = 1"
+echo "  UPDATE point id=42 (1 row) in $(ms "$MUT_START") ms"
+MUT_START=$(date +%s%N)
+run_ch "ALTER TABLE qa5.t UPDATE g = 7 WHERE id >= 0 AND id < 100000 SETTINGS mutations_sync = 1"
+echo "  UPDATE range id<100000 (100k rows) in $(ms "$MUT_START") ms"
+MUT_START=$(date +%s%N)
+run_ch "ALTER TABLE qa5.t DELETE WHERE id >= 0 AND id < 100000 SETTINGS mutations_sync = 1"
+echo "  DELETE range id<100000 (100k rows) in $(ms "$MUT_START") ms"
+MUT_START=$(date +%s%N)
+run_ch "ALTER TABLE qa5.t DELETE WHERE id = 42 SETTINGS mutations_sync = 1"
+echo "  DELETE point id=42 in $(ms "$MUT_START") ms"
+
 say "on-disk footprint per replica node (RAM)"
 docker exec ch1 sh -c 'du -sh /var/lib/clickhouse/data/qa5/t' 2>/dev/null || true
 

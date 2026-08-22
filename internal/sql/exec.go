@@ -1,6 +1,9 @@
 package sql
 
-import "time"
+import (
+	"log"
+	"time"
+)
 
 // Row is an ordered slice of values.
 type Row []Value
@@ -22,6 +25,7 @@ type Engine interface {
 	GetSchema(name string) (*TableSchema, error)
 	Insert(table string, row map[string]Value) error
 	Scan(table string) ([]Row, error)
+	Get(table string, pkValues []Value) (Row, error)
 	Update(table string, pkValues []Value, set map[string]Value) error
 	Delete(table string, pkValues []Value) error
 	// DeleteRange removes every row whose encoded PK falls inside the range
@@ -51,6 +55,23 @@ type IndexEngine interface {
 // one table inside a single transaction (one write lock, one store commit).
 type BatchInsertEngine interface {
 	BatchInsert(table string, rows []map[string]Value) (int64, error)
+}
+
+// BatchRowsEngine is an optional engine capability like BatchInsertEngine but
+// taking rows in schema column order (a Row is index-aligned with
+// schema.Columns), avoiding the per-row map allocation BatchInsert performs.
+type BatchRowsEngine interface {
+	BatchInsertRows(table string, rows []Row) (int64, error)
+}
+
+// ConstRangeUpdater is an optional engine capability: assigning constant
+// values to columns of every row whose encoded PK falls inside a range,
+// streaming the merged PK column and writing pre-encoded cells directly
+// instead of materializing rows (vectorized constant-SET UPDATE). The bool
+// result reports whether the table shape was supported; false makes callers
+// fall back to the generic scan-and-rewrite path.
+type ConstRangeUpdater interface {
+	UpdateColumnConst(table string, consts map[int]Value, r *PKRange) (int64, bool, error)
 }
 
 // KVEntry is one raw key/value pair returned by a KV SCAN.
@@ -346,6 +367,313 @@ func (ex *Executor) execUpdate(s *UpdateStmt) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Point fast path: a WHERE that pins the complete primary key reads and
+	// updates the single row directly instead of scanning the whole table.
+	if rng, exact := PKRangeFromWhere(schema, s.Where); exact && rng != nil &&
+		rng.Lower != nil && rng.Upper != nil && pkEqualBound(rng.Lower, rng.Upper) {
+		pk := append([]Value(nil), rng.Lower.Prefix...)
+		row, err := ex.Eng.Get(s.Table, pk)
+		if err != nil {
+			return nil, err
+		}
+		if row == nil {
+			return &Result{Type: "update", Affected: 0}, nil
+		}
+		ctx := rowContext(schema, row)
+		set, err := evalSetsCtx(schema, s.Sets, ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := ex.Eng.Update(s.Table, pk, set); err != nil {
+			return nil, err
+		}
+		return &Result{Type: "update", Affected: 1}, nil
+	}
+	// Columnar range fast path: for a CSTORE table a WHERE that folds into a
+	// primary-key range reads only the rows inside that range columnar (one
+	// granule-cached pass, no per-row decode) and writes every affected row
+	// back in a single transaction. This is the ClickHouse mutation model:
+	// rewrite the affected rows, not the whole table, with no per-row
+	// Get/Update round trip.
+	if IsColumnarEngine(schema.Engine) {
+		if ce, ok := ex.Eng.(ColumnEngine); ok {
+			rng, exact := PKRangeFromWhere(schema, s.Where)
+			return ex.execUpdateColumnar(s, schema, ce, rng, exact)
+		}
+	}
+	return ex.execUpdateScan(s, schema)
+}
+
+// execUpdateColumnar implements UPDATE over a columnar table. It scans only the
+// rows inside the PK range derived from WHERE (a superset when the WHERE mixes
+// PK and non-PK predicates; the residual WHERE is re-evaluated per row only in
+// that case), then writes every affected row back in a single transaction.
+//
+// CH partial-merge: when the engine supports batch rows, only the columns the
+// statement actually needs are read (PK columns for the keys, plus every column
+// referenced by the SET expressions or the WHERE predicate), and only the
+// columns assigned by SET are written. Every other column is marked Missing so
+// the storage inherits its value from the previous row version instead of
+// rewriting it.
+func (ex *Executor) execUpdateColumnar(s *UpdateStmt, schema *TableSchema, ce ColumnEngine, rng *PKRange, rngExact bool) (*Result, error) {
+	// Rewriting a PK column changes the row's key (delete + reinsert); the
+	// batch upsert below keys rows by PK, so fall back to the generic path.
+	for _, item := range s.Sets {
+		for _, c := range pkIndex(schema) {
+			if item.Column == c {
+				return ex.execUpdateScan(s, schema)
+			}
+		}
+	}
+	// Vectorized constant-SET fast path: when WHERE folds exactly into the PK
+	// range and every assignment is a literal, no rows are materialized — the
+	// storage streams the merged PK column and each assigned cell is encoded
+	// once and shared by every rewritten key (CH rewrites a mutation's target
+	// columns the same way).
+	if rngExact {
+		if cru, ok := ex.Eng.(ConstRangeUpdater); ok {
+			if consts, allLit := updateConstSets(schema, s.Sets); allLit {
+				n, handled, uerr := cru.UpdateColumnConst(s.Table, consts, rng)
+				if uerr != nil {
+					return nil, uerr
+				}
+				if handled {
+					return &Result{Type: "update", Affected: n}, nil
+				}
+			}
+		}
+	}
+	br, rowsOK := ex.Eng.(BatchRowsEngine)
+	be, batchOK := ex.Eng.(BatchInsertEngine)
+	// CH partial-merge: when the engine accepts schema-ordered rows, read only
+	// the columns the statement needs and write only the assigned ones (others
+	// marked Missing). Engines without batch rows fall back to a full rewrite:
+	// read every column, write the whole row.
+	needCols := make([]int, len(schema.Columns))
+	for i := range needCols {
+		needCols[i] = i
+	}
+	assigned := make(map[string]bool)
+	needColsSet := make(map[string]bool)
+	for _, item := range s.Sets {
+		assigned[item.Column] = true
+	}
+	if rowsOK {
+		need := updateRefColumns(s)
+		for _, c := range pkIndex(schema) {
+			need[c] = true
+		}
+		needCols = needCols[:0]
+		for i, c := range schema.Columns {
+			if need[c.Name] {
+				needCols = append(needCols, i)
+				needColsSet[c.Name] = true
+			}
+		}
+	}
+	tScan := time.Now()
+	rows, err := ce.ScanColumns(s.Table, needCols, rng)
+	scanDur := time.Since(tScan)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if scanDur > 150*time.Millisecond {
+			log.Printf("UPDATE-PHASE-SLOW: scan %v", scanDur)
+		}
+	}()
+	updated := make([]Row, 0, len(rows))
+	affected := int64(0)
+	ctx := make(map[string]Value, len(schema.Columns))
+	for _, r := range rows {
+		// Reuse one context map across rows; overwrite each column slot
+		// before evaluating so no per-row allocation happens.
+		for i, c := range schema.Columns {
+			ctx[c.Name] = r[i]
+		}
+		if !rngExact && s.Where != nil {
+			v, err := Eval(s.Where, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if b, ok := boolOf(v); !ok || !b {
+				continue
+			}
+		}
+		if err := evalSetsIntoRow(schema, s.Sets, ctx, r); err != nil {
+			return nil, err
+		}
+		// CH partial-merge: columns that were not read and are not assigned by
+		// SET keep their previous value — mark them Missing so the storage
+		// inherits the old cell instead of writing a new one. (Read columns
+		// that are not SET targets carry their own value already.)
+		if rowsOK {
+			for i, c := range schema.Columns {
+				if !needColsSet[c.Name] && !assigned[c.Name] {
+					r[i] = MissingValue
+				}
+			}
+		}
+		affected++
+		updated = append(updated, r)
+	}
+	if affected > 0 {
+		tWrite := time.Now()
+		writeDone := func() {
+			if d := time.Since(tWrite); d > 150*time.Millisecond {
+				log.Printf("UPDATE-PHASE-SLOW: write %v (scan was %v)", d, scanDur)
+			}
+		}
+		if rowsOK {
+			if _, err := br.BatchInsertRows(s.Table, updated); err != nil {
+				return nil, err
+			}
+			writeDone()
+		} else if batchOK {
+			maps := make([]map[string]Value, 0, len(updated))
+			for _, r := range updated {
+				m := make(map[string]Value, len(schema.Columns))
+				for i, c := range schema.Columns {
+					m[c.Name] = r[i]
+				}
+				maps = append(maps, m)
+			}
+			if _, err := be.BatchInsert(s.Table, maps); err != nil {
+				return nil, err
+			}
+		} else {
+			for _, r := range updated {
+				if err := ex.updateRowViaGet(s, schema, r); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return &Result{Type: "update", Affected: affected}, nil
+}
+
+// updateRefColumns collects every column name referenced by an UPDATE's SET
+// value expressions and its WHERE predicate (assigned targets excluded).
+func updateRefColumns(s *UpdateStmt) map[string]bool {
+	refs := map[string]bool{}
+	var walk func(e Expr)
+	walk = func(e Expr) {
+		switch n := e.(type) {
+		case *Ident:
+			refs[n.Name] = true
+		case *Literal:
+		case *BinaryOp:
+			walk(n.Left)
+			walk(n.Right)
+		case *UnaryOp:
+			walk(n.Expr)
+		case *Call:
+			for _, a := range n.Args {
+				walk(a)
+			}
+		case *CastExpr:
+			walk(n.Expr)
+		}
+	}
+	for _, item := range s.Sets {
+		walk(item.Value)
+	}
+	if s.Where != nil {
+		walk(s.Where)
+	}
+	return refs
+}
+
+// updateConstSets returns the column-index→constant map of an UPDATE's SET
+// list when every assignment is a plain literal (the bulk-update shape);
+// ok=false otherwise. Values go through Eval+Convert for exact parity with
+// evalSetsIntoRow, including NULL handling.
+func updateConstSets(schema *TableSchema, sets []*SetItem) (map[int]Value, bool) {
+	consts := make(map[int]Value, len(sets))
+	ctx := map[string]Value{}
+	for _, item := range sets {
+		if _, ok := item.Value.(*Literal); !ok {
+			return nil, false
+		}
+		v, err := Eval(item.Value, ctx)
+		if err != nil {
+			return nil, false
+		}
+		idx := -1
+		var colType Type = TypeNull
+		for i, c := range schema.Columns {
+			if c.Name == item.Column {
+				idx, colType = i, c.Type
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, false
+		}
+		if colType != TypeNull {
+			cv, err := Convert(v, colType)
+			if err != nil {
+				return nil, false
+			}
+			v = cv
+		}
+		consts[idx] = v
+	}
+	return consts, true
+}
+
+// evalSetsIntoRow evaluates the SET assignments of an UPDATE for one row,
+// writing the new values into the row slice (index-aligned with the schema).
+// ctx is a caller-owned context map already filled with this row's values.
+func evalSetsIntoRow(schema *TableSchema, sets []*SetItem, ctx map[string]Value, row Row) error {
+	for _, item := range sets {
+		v, err := Eval(item.Value, ctx)
+		if err != nil {
+			return err
+		}
+		for i, c := range schema.Columns {
+			if c.Name == item.Column {
+				colType := c.Type
+				if colType != TypeNull {
+					v, err = Convert(v, colType)
+					if err != nil {
+						return err
+					}
+				}
+				row[i] = v
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// updateRowViaGet re-applies the SET assignments of an UPDATE to an already
+// materialized row through the per-row Update path (used only by engines that
+// have neither batch capability).
+func (ex *Executor) updateRowViaGet(s *UpdateStmt, schema *TableSchema, row Row) error {
+	ctx := make(map[string]Value, len(schema.Columns))
+	for i, c := range schema.Columns {
+		ctx[c.Name] = row[i]
+	}
+	set := make(map[string]Value, len(s.Sets))
+	for _, item := range s.Sets {
+		v, err := Eval(item.Value, ctx)
+		if err != nil {
+			return err
+		}
+		set[item.Column] = v
+	}
+	pk := make([]Value, 0, len(pkIndex(schema)))
+	for _, c := range pkIndex(schema) {
+		pk = append(pk, ctx[c])
+	}
+	return ex.Eng.Update(s.Table, pk, set)
+}
+
+// execUpdateScan is the generic UPDATE path: a full scan with one Update call
+// per matching row.
+func (ex *Executor) execUpdateScan(s *UpdateStmt, schema *TableSchema) (*Result, error) {
 	rows, err := ex.Eng.Scan(s.Table)
 	if err != nil {
 		return nil, err
@@ -363,27 +691,9 @@ func (ex *Executor) execUpdate(s *UpdateStmt) (*Result, error) {
 				continue
 			}
 		}
-		set := make(map[string]Value)
-		for _, item := range s.Sets {
-			v, err := Eval(item.Value, ctx)
-			if err != nil {
-				return nil, err
-			}
-			// find column def
-			colType := TypeNull
-			for _, c := range schema.Columns {
-				if c.Name == item.Column {
-					colType = c.Type
-					break
-				}
-			}
-			if colType != TypeNull {
-				v, err = Convert(v, colType)
-				if err != nil {
-					return nil, err
-				}
-			}
-			set[item.Column] = v
+		set, err := evalSetsCtx(schema, s.Sets, ctx)
+		if err != nil {
+			return nil, err
 		}
 		pk := make([]Value, len(pkIdx))
 		for i, c := range pkIdx {
@@ -395,6 +705,46 @@ func (ex *Executor) execUpdate(s *UpdateStmt) (*Result, error) {
 		affected++
 	}
 	return &Result{Type: "update", Affected: affected}, nil
+}
+
+// pkEqualBound reports whether two PK bounds pin the exact same key.
+func pkEqualBound(a, b *PKBound) bool {
+	if a == nil || b == nil || len(a.Prefix) != len(b.Prefix) {
+		return false
+	}
+	for i := range a.Prefix {
+		if c, err := Compare(a.Prefix[i], b.Prefix[i]); err != nil || c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// evalSetsCtx computes the SET assignments of an UPDATE for one row context,
+// converting each value to the target column's type.
+func evalSetsCtx(schema *TableSchema, sets []*SetItem, ctx map[string]Value) (map[string]Value, error) {
+	set := make(map[string]Value, len(sets))
+	for _, item := range sets {
+		v, err := Eval(item.Value, ctx)
+		if err != nil {
+			return nil, err
+		}
+		colType := TypeNull
+		for _, c := range schema.Columns {
+			if c.Name == item.Column {
+				colType = c.Type
+				break
+			}
+		}
+		if colType != TypeNull {
+			v, err = Convert(v, colType)
+			if err != nil {
+				return nil, err
+			}
+		}
+		set[item.Column] = v
+	}
+	return set, nil
 }
 
 func (ex *Executor) execDelete(s *DeleteStmt) (*Result, error) {

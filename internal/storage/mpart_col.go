@@ -445,6 +445,29 @@ func (t *mpartTx) walkMergedNumeric(table string, colIdx int, typ sqlType, plLow
 	return t.walkMergedNumericLocked(table, colIdx, typ, plLower, plUpper, fn)
 }
 
+// updateConstRange assigns constant cells to every live row whose encoded PK
+// falls inside [plLower, plUpper). The merged view is walked keys-only
+// (walkMergedLocked with colIdx=-1 loads just pks+dels — no column decode),
+// which yields each live key exactly once in ascending order; every rewritten
+// key shares the same pre-encoded cell slice, so the per-row cost is one map
+// insert — no row materialization, no per-key encoding, no per-row evaluation.
+// Deleted rows are skipped; the live-row count stays untouched
+// (rowPutCellsNoCount), since every key comes from the live data itself.
+func (t *mpartTx) updateConstRange(table string, cells [][]byte, plLower, plUpper []byte) (int64, error) {
+	var affected int64
+	err := t.walkMergedLocked(table, -1, false, false, plLower, plUpper, func(pk []byte, _ []byte, _ [][]byte, del bool) error {
+		if del {
+			return nil
+		}
+		if err := t.rowPutCellsNoCount(table, pk, cells); err != nil {
+			return err
+		}
+		affected++
+		return nil
+	})
+	return affected, err
+}
+
 // fastNumericParts streams every part's numeric column without materializing
 // PK lists, using part metadata for range/disjointness checks. Returns true
 // when it fully handled the query. The fn callback receives a nil pk.
@@ -629,16 +652,37 @@ func (t *mpartTx) walkMergedNumericLocked(table string, colIdx int, typ sqlType,
 		if !s.done() {
 			heap.Push(&h, s)
 		}
-		for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) {
-			top := h.h[0]
-			top.i += top.step
-			if top.done() {
-				heap.Pop(&h)
-			} else {
-				heap.Fix(&h, 0)
+		// CH partial-merge: the newest version may be a partial row whose cell
+		// for this column is empty. Resolve the value from the first non-empty
+		// older version before the generic decode below.
+		val, null, ok := numericAt(s, i, typ)
+		if !s.dels[i] && !ok {
+			// cell is missing or not numeric-shaped: try older versions.
+			for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) {
+				top := h.h[0]
+				if !top.dels[top.i] {
+					if v2, n2, ok2 := numericAt(top, top.i, typ); ok2 {
+						val, null, ok = v2, n2, true
+					}
+				}
+				top.i += top.step
+				if top.done() {
+					heap.Pop(&h)
+				} else {
+					heap.Fix(&h, 0)
+				}
+			}
+		} else {
+			for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) {
+				top := h.h[0]
+				top.i += top.step
+				if top.done() {
+					heap.Pop(&h)
+				} else {
+					heap.Fix(&h, 0)
+				}
 			}
 		}
-		val, null, ok := numericAt(s, i, typ)
 		if !ok {
 			// Generic fallback: cell is not shaped as a numeric type.
 			vv := makeReader(s.cells[i]).Variant()

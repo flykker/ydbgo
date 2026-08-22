@@ -3,6 +3,7 @@ package raftsvc
 import (
 	"errors"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -28,7 +29,13 @@ func NewFSM(eng *storage.Engine) *FSM {
 // ONE durable store transaction, so the batch costs a single storage fsync
 // (group commit at the storage layer).
 func (f *FSM) Apply(l *raft.Log) interface{} {
+	t0 := time.Now()
 	stmts, err := sqlx.DecodeStatements(l.Data)
+	defer func() {
+		if d := time.Since(t0); d > 150*time.Millisecond {
+			log.Printf("FSM-APPLY-SLOW: %v (%d stmts, %d bytes)", d, len(stmts), len(l.Data))
+		}
+	}()
 	if err != nil {
 		return err
 	}

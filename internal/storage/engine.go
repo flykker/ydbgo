@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"sync"
@@ -166,21 +167,27 @@ func (e *Engine) UpdateBatch(fn func() error) error {
 }
 
 func (e *Engine) updateBatchLocked(fn func() error) error {
+	t0 := time.Now()
 	txs := map[store]storeTx{}
 	e.active.Store(&txs)
 	defer func() { e.active.Store(nil) }()
 	cerr := fn()
+	fnDur := time.Since(t0)
 	if cerr != nil {
 		for _, tx := range txs {
 			tx.rollback()
 		}
 		return cerr
 	}
+	t1 := time.Now()
 	var firstErr error
 	for _, tx := range txs {
 		if err := tx.commit(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	if d := time.Since(t1); d > 150*time.Millisecond {
+		log.Printf("STORE-COMMIT-SLOW: %v (exec %v)", d, fnDur)
 	}
 	return firstErr
 }
@@ -347,10 +354,13 @@ func (t sqlType) String() string {
 type sqlValue struct {
 	typ  sqlType
 	null bool
-	i    int64
-	f    float64
-	s    string
-	b    bool
+	// missing marks a column that keeps its previous value: the cell is stored
+	// as an empty (len-0) blob so walkMerged inherits it from an older version.
+	missing bool
+	i       int64
+	f       float64
+	s       string
+	b       bool
 }
 
 // notFoundError signals missing table.

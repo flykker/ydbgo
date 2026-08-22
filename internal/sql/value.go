@@ -17,9 +17,19 @@ type Value struct {
 	Str  string
 	Bool bool
 	Tm   time.Time
+
+	// Missing marks a column that must keep its existing value (an UPDATE that
+	// rewrites only the touched columns). It is distinct from Null: Missing
+	// cells are physically omitted from the new row version and inherited from
+	// the older one at read time.
+	Missing bool
 }
 
 var NullValue = Value{Type: TypeNull, Null: true}
+
+// MissingValue marks a column whose value is inherited from the previous row
+// version rather than written.
+var MissingValue = Value{Type: TypeNull, Missing: true}
 
 func IntValue(v int64) Value     { return Value{Type: TypeInt, Int: v} }
 func FloatValue(v float64) Value { return Value{Type: TypeFloat, Flt: v} }

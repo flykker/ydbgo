@@ -13,6 +13,7 @@ import (
 var (
 	_ sqlx.Engine            = (*Engine)(nil)
 	_ sqlx.BatchInsertEngine = (*Engine)(nil)
+	_ sqlx.BatchRowsEngine   = (*Engine)(nil)
 )
 
 // CreateTable implements sqlx.Engine.
@@ -205,6 +206,136 @@ func (e *Engine) BatchInsert(table string, rows []map[string]sqlx.Value) (int64,
 	return affected, nil
 }
 
+// BatchInsertRows inserts rows given in schema column order (index-aligned
+// with table columns) inside a single transaction, avoiding the per-row map
+// allocation BatchInsert performs. It implements sqlx.BatchRowsEngine.
+func (e *Engine) BatchInsertRows(table string, rows []sqlx.Row) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	unlock := e.writeLock()
+	defer unlock()
+	t, err := e.getTable(table)
+	if err != nil {
+		return 0, err
+	}
+	var affected int64
+	err = e.writeTo(e.store(t.engine), func(tx storeTx) error {
+		kv := make([]sqlValue, 0, len(t.pk))
+		var keyBuf []byte
+		var scratch []byte
+		var ov map[string]sqlValue
+		for _, row := range rows {
+			kv = kv[:0]
+			for _, pkIdx := range t.pk {
+				kv = append(kv, fromSQLValue(row[pkIdx]))
+			}
+			keyBuf = encodeKeyInto(kv, keyBuf[:0])
+			if len(t.indexes) > 0 {
+				key := string(keyBuf)
+				old, err := tx.rowGet(t.name, keyBuf)
+				if err != nil {
+					return err
+				}
+				if len(old) > 0 {
+					ov, err = decodeRow(old, t)
+					if err != nil {
+						return err
+					}
+					removeRowIndexes(t, ov, key)
+				}
+			}
+			cells := make([][]byte, len(t.cols))
+			for i := range t.cols {
+				if row[i].Missing {
+					cells[i] = nil
+					continue
+				}
+				start := len(scratch)
+				scratch = appendVariant(scratch, fromSQLValue(row[i]))
+				cells[i] = scratch[start:len(scratch):len(scratch)]
+			}
+			if nc, ok := tx.(rowPutCellsNoCouter); ok {
+				if err := nc.rowPutCellsNoCount(t.name, keyBuf, cells); err != nil {
+					return err
+				}
+			} else if err := tx.rowPutCells(t.name, keyBuf, cells); err != nil {
+				return err
+			}
+			if len(t.indexes) > 0 {
+				vals := make(map[string]sqlValue, len(t.cols))
+				for i, c := range t.cols {
+					if row[i].Missing && ov != nil {
+						vals[c.name] = ov[c.name]
+					} else {
+						vals[c.name] = fromSQLValue(row[i])
+					}
+				}
+				addRowIndexes(t, vals, string(keyBuf))
+			}
+			affected++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
+// UpdateColumnConst implements sqlx.ConstRangeUpdater: it assigns constant
+// values to columns of every live row whose encoded PK falls inside r,
+// without materializing rows. Each assigned column is encoded once up front
+// and every rewritten key shares the same cell slices, so the per-row cost is
+// one small key encode plus one overlay insert. handled=false reports tables
+// the fast path does not support (non-mpart engines, secondary indexes,
+// composite or non-int PKs) so callers fall back to the generic rewrite.
+func (e *Engine) UpdateColumnConst(table string, consts map[int]sqlx.Value, r *sqlx.PKRange) (int64, bool, error) {
+	if len(consts) == 0 {
+		return 0, false, nil
+	}
+	unlock := e.writeLock()
+	defer unlock()
+	t, err := e.getTable(table)
+	if err != nil {
+		return 0, false, err
+	}
+	if t.engine != "CSTORE2" || len(t.indexes) > 0 || len(t.pk) != 1 {
+		return 0, false, nil
+	}
+	pkCol := t.pk[0]
+	if pkCol >= len(t.cols) || t.cols[pkCol].typ != tInt {
+		return 0, false, nil
+	}
+	if _, rewritesPk := consts[pkCol]; rewritesPk {
+		return 0, false, nil
+	}
+	cells := make([][]byte, len(t.cols))
+	scratch := make([]byte, 0, 16*len(consts))
+	for idx, v := range consts {
+		start := len(scratch)
+		scratch = appendVariant(scratch, fromSQLValue(v))
+		cells[idx] = scratch[start:len(scratch):len(scratch)]
+	}
+	plLower, plUpper := PKRangeBytes(r)
+	var affected int64
+	handled := false
+	err = e.writeTo(e.store(t.engine), func(tx storeTx) error {
+		cru, ok := tx.(constRangeUpdater)
+		if !ok {
+			return nil
+		}
+		handled = true
+		n, uerr := cru.updateConstRange(t.name, cells, plLower, plUpper)
+		affected = n
+		return uerr
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return affected, handled, nil
+}
+
 // Update implements sqlx.Engine.
 func (e *Engine) Update(table string, pkValues []sqlx.Value, set map[string]sqlx.Value) error {
 	unlock := e.writeLock()
@@ -287,6 +418,42 @@ func (e *Engine) Delete(table string, pkValues []sqlx.Value) error {
 		}
 		return tx.rowDelete(t.name, []byte(pkKey))
 	})
+}
+
+// Get implements sqlx.Engine: it resolves a row by its exact primary key.
+func (e *Engine) Get(table string, pkValues []sqlx.Value) (sqlx.Row, error) {
+	unlock := e.readLock()
+	defer unlock()
+	t, err := e.getTable(table)
+	if err != nil {
+		return nil, err
+	}
+	key := make([]sqlValue, len(pkValues))
+	for i, v := range pkValues {
+		key[i] = fromSQLValue(v)
+	}
+	pkKey := encodeKey(key)
+	st := e.store(t.engine)
+	var row sqlx.Row
+	e.readFrom(st, func(tx storeTx) error {
+		data, err := tx.rowGet(t.name, []byte(pkKey))
+		if err != nil {
+			return err
+		}
+		if data == nil {
+			return nil
+		}
+		ov, err := decodeRow(data, t)
+		if err != nil {
+			return err
+		}
+		row = make(sqlx.Row, len(t.cols))
+		for i, c := range t.cols {
+			row[i] = toSQLValue(ov[c.name])
+		}
+		return nil
+	})
+	return row, nil
 }
 
 // DeleteRange implements sqlx.Engine: it removes every CSTORE row whose
@@ -509,6 +676,36 @@ func encodeKey(vals []sqlValue) string {
 	return string(b.Bytes())
 }
 
+// encodeKeyInto is encodeKey appending into a caller-owned buffer, so hot
+// batch writers (UPDATE rewrite loops) reuse one allocation across rows.
+func encodeKeyInto(vals []sqlValue, buf []byte) []byte {
+	for _, v := range vals {
+		buf = append(buf, byte(v.typ), 0xff)
+		switch v.typ {
+		case tInt:
+			u := uint64(v.i) + 1<<63
+			buf = append(buf, byte(u>>56), byte(u>>48), byte(u>>40), byte(u>>32), byte(u>>24), byte(u>>16), byte(u>>8), byte(u))
+		case tFloat:
+			u := mathFloatToSortable(v.f)
+			buf = append(buf, byte(u>>56), byte(u>>48), byte(u>>40), byte(u>>32), byte(u>>24), byte(u>>16), byte(u>>8), byte(u))
+		case tString:
+			buf = append(buf, v.s...)
+			buf = append(buf, 0)
+		case tBool:
+			if v.b {
+				buf = append(buf, 2)
+			} else {
+				buf = append(buf, 1)
+			}
+		case tTimestamp:
+			u := uint64(v.i) + 1<<63
+			buf = append(buf, byte(u>>56), byte(u>>48), byte(u>>40), byte(u>>32), byte(u>>24), byte(u>>16), byte(u>>8), byte(u))
+		}
+		buf = append(buf, 0xff)
+	}
+	return buf
+}
+
 func mathFloatToSortable(f float64) uint64 {
 	u := math.Float64bits(f)
 	if u&(1<<63) != 0 {
@@ -550,6 +747,9 @@ func toSQLValue(v sqlValue) sqlx.Value {
 }
 
 func fromSQLValue(v sqlx.Value) sqlValue {
+	if v.Missing {
+		return sqlValue{missing: true}
+	}
 	switch v.Type {
 	case sqlx.TypeInt:
 		if v.Null {

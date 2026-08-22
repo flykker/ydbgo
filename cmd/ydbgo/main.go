@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"runtime"
 	"time"
 
 	"ydbgo/internal/config"
@@ -50,6 +51,8 @@ func main() {
 		runClient(os.Args[2:])
 	case "bench":
 		runBench(os.Args[2:])
+	case "updel":
+		benchUpDel(os.Args[2:])
 	case "repl", "shell":
 		runRepl(os.Args[2:])
 	case "-h", "--help", "help":
@@ -171,6 +174,8 @@ func runRepl(args []string) {
 // startPprof exposes net/http/pprof so CPU/memory profiles can be captured from
 // a running node via "go tool pprof http://host:port/debug/pprof/profile".
 func startPprof(addr string) {
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)

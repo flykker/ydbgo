@@ -258,6 +258,47 @@ func TestShardedAdminCompact(t *testing.T) {
 	}
 }
 
+// TestShardedRangeUpdate verifies UPDATE over a PK range on a CSTORE table goes
+// through the columnar range path: only the rows inside the range are touched,
+// the residual WHERE is honoured, and the writes land in one transaction.
+func TestShardedRangeUpdate(t *testing.T) {
+	n1 := startClusterNode(t, "n1", freePort(t), "", 2)
+	defer n1.stop()
+	n2 := startClusterNode(t, "n2", freePort(t), n1.sql1, 2)
+	defer n2.stop()
+
+	execOK(t, n1.c, "CREATE TABLE ru (id int64 primary key, v string, score int64) ENGINE=CSTORE")
+	for i := int64(1); i <= 10; i++ {
+		execOK(t, n1.c, fmt.Sprintf("INSERT INTO ru VALUES (%d, 'r%d', %d)", i, i, i*10))
+	}
+	waitQuery(t, n1.c, "SELECT COUNT(*) AS c FROM ru", "10", 15*time.Second)
+
+	// range UPDATE: bump score for id in [3, 7), and only those rows
+	r := execOK(t, n1.c, "UPDATE ru SET score = score + 1 WHERE id >= 3 AND id < 7")
+	if r.Result.Affected != 4 {
+		t.Fatalf("range update affected: %d (want 4)", r.Result.Affected)
+	}
+	waitQuery(t, n1.c, "SELECT score FROM ru WHERE id = 3", "31", 15*time.Second)
+	waitQuery(t, n1.c, "SELECT score FROM ru WHERE id = 6", "61", 15*time.Second)
+	waitQuery(t, n1.c, "SELECT score FROM ru WHERE id = 2", "20", 15*time.Second)
+	waitQuery(t, n1.c, "SELECT score FROM ru WHERE id = 7", "70", 15*time.Second)
+
+	// residual WHERE on top of the PK range: only id=4 matches the extra filter
+	r = execOK(t, n1.c, "UPDATE ru SET v = 'hit' WHERE id >= 2 AND id < 9 AND score = 41")
+	if r.Result.Affected != 1 {
+		t.Fatalf("residual range update affected: %d (want 1)", r.Result.Affected)
+	}
+	waitQuery(t, n1.c, "SELECT v FROM ru WHERE id = 4", "hit", 15*time.Second)
+	waitQuery(t, n1.c, "SELECT v FROM ru WHERE id = 3", "r3", 15*time.Second)
+
+	// whole-table UPDATE over a CSTORE table also goes through the columnar path
+	r = execOK(t, n1.c, "UPDATE ru SET v = 'all'")
+	if r.Result.Affected != 10 {
+		t.Fatalf("full update affected: %d (want 10)", r.Result.Affected)
+	}
+	waitQuery(t, n1.c, "SELECT v FROM ru WHERE id = 10", "all", 15*time.Second)
+}
+
 // TestShardedDropTableRecreate verifies DROP TABLE physically destroys every
 // shard replica so re-creating a table with the same name starts empty. The
 // bug: shard IDs are deterministic (table + split path), so a re-created table
@@ -345,6 +386,13 @@ func TestShardedMpart(t *testing.T) {
 	r := execOK(t, n2.c, "SELECT v FROM mp_t WHERE id = 2")
 	if len(r.Result.Rows) != 1 || r.Result.Rows[0][0] != "b" {
 		t.Fatalf("mpart select via n2: %v", r.Result.Rows)
+	}
+	// point projection of the last column must not be scrambled by the
+	// coordinator's projected-scan reordering (regression: expandProjected
+	// double-expanded rows that rowsFromPayload already padded to full width)
+	r = execOK(t, n2.c, "SELECT score FROM mp_t WHERE id = 2")
+	if len(r.Result.Rows) != 1 || r.Result.Rows[0][0] != "20" {
+		t.Fatalf("mpart last-column projection: %v", r.Result.Rows)
 	}
 
 	// split and keep writing/reading

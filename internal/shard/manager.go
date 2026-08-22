@@ -564,30 +564,9 @@ func (m *Manager) scanShardProjected(spec *ShardSpec, cols []string, tailSQL str
 	if err != nil {
 		return nil, err
 	}
-	return expandProjected(cols, ts.Schema, rows), nil
-}
-
-// expandProjected reorders/pads projected (narrow) rows back to full schema
-// width, filling untouched columns with type zeroes.
-func expandProjected(cols []string, schema *sqlx.TableSchema, rows []sqlx.Row) []sqlx.Row {
-	colIdx := map[string]int{}
-	for i, name := range cols {
-		colIdx[name] = i
-	}
-	out := make([]sqlx.Row, 0, len(rows))
-	for _, r := range rows {
-		row := make(sqlx.Row, len(schema.Columns))
-		for i, c := range schema.Columns {
-			ci, ok := colIdx[c.Name]
-			if !ok || ci >= len(r) {
-				row[i] = zeroForType(c.Type)
-				continue
-			}
-			row[i] = r[ci]
-		}
-		out = append(out, row)
-	}
-	return out
+	// shardReadRows already materializes full-width rows (rowsFromPayload pads
+	// by schema column name), so no further expansion is needed.
+	return rows, nil
 }
 
 // mount / unmount

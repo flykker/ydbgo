@@ -44,6 +44,20 @@ type storeTx interface {
 	rollback() error
 }
 
+// rowPutCellsNoCouter is an optional storeTx capability: batch writers that
+// know every key already exists (columnar UPDATE) skip the per-row existence
+// probe used to maintain the live-row count.
+type rowPutCellsNoCouter interface {
+	rowPutCellsNoCount(table string, key []byte, cells [][]byte) error
+}
+
+// constRangeUpdater is an optional storeTx capability: assign constant cells
+// to every live row inside a PK range without materializing rows (vectorized
+// constant-SET UPDATE fast path).
+type constRangeUpdater interface {
+	updateConstRange(table string, cells [][]byte, plLower, plUpper []byte) (int64, error)
+}
+
 // newStoreFor opens a durable backend for the given storage engine. "" and
 // "TABLE" use pebble; "KV" uses the MVCC byte store (internal/kv); "CSTORE"
 // uses the columnar MVCC store (internal/kv with column-major layout).

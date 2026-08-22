@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -33,6 +34,15 @@ import (
 // mpartFlushThreshold is the mem-part row count that triggers a flush to a
 // new immutable part.
 const mpartFlushThreshold = 65536
+
+// mpartMergeMinParts is how many on-disk parts a table must accumulate before
+// the idle flusher merges overlapping ones. Partial-merge UPDATEs rewrite the
+// same window repeatedly; each flush adds one part that overlaps the base, and
+// eager merging would rewrite the whole table after every statement. Reads stay
+// exact without merges (column-wise inheritance + the covering-newest-source
+// fast path), so merging is deferred until the part count justifies the
+// full-table rewrite (ClickHouse defers background merges the same way).
+const mpartMergeMinParts = 10
 
 // mpartMergeChunk is the maximum part size compactTable/mergeIdle rewrite a
 // table into. Merges are allowed to produce far larger parts than the write
@@ -107,6 +117,14 @@ type memPart struct {
 	cacheDels  []bool
 	cacheCells map[int][][]byte // lazily built per column index
 	cacheFulls [][][]byte
+
+	// hint carries the rows in insertion order when a writer knows it inserted
+	// each key exactly once in ascending PK order (the columnar UPDATE batch:
+	// its rows come sorted from the scan). len(hint) == len(rows) is the
+	// validity check — any duplicate key or unrelated mutation breaks the
+	// length match and the hint is ignored. Lets flush/ensureCached skip the
+	// O(n log n) sort.
+	hint []*memRow
 }
 
 // mpartGranule is one sparse-index entry: the granule's PK window (pkMax) and
@@ -346,6 +364,7 @@ func openMpart(dir string) (*mpartStore, error) {
 // on Close. It also drains flushCh, which carries full mem parts detached by
 // a commit that crossed the mem size threshold (async threshold flush).
 func (s *mpartStore) startIdleFlusher() {
+	noMerge := os.Getenv("YDBGO_NO_MERGE") == "1"
 	go func() {
 		t := time.NewTicker(mpartIdleFlushInterval / 2)
 		defer t.Stop()
@@ -358,7 +377,9 @@ func (s *mpartStore) startIdleFlusher() {
 				s.flushJobAsync(j)
 			case now := <-t.C:
 				s.flushIdle(now)
-				s.mergeIdle(now)
+				if !noMerge {
+					s.mergeIdle(now)
+				}
 			}
 		}
 	}()
@@ -412,7 +433,7 @@ func (s *mpartStore) mergeIdle(now time.Time) {
 		if now.Sub(last) < mpartIdleFlushInterval {
 			continue
 		}
-		if s.partsOverlap(tbl) {
+		if len(s.parts[tbl]) >= mpartMergeMinParts && s.partsOverlap(tbl) {
 			targets = append(targets, tbl)
 		}
 	}
@@ -626,20 +647,44 @@ func sortMemRows(rows []*memRow) {
 	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].pk, rows[j].pk) < 0 })
 }
 
+// memRowsSorted reports whether rows are already in ascending pk order. A
+// single-batch UPDATE writes exactly the keys its scan returned (sorted), so
+// one linear pass replaces an O(n log n) sort on the flush path.
+func memRowsSorted(rows []*memRow) bool {
+	for i := 1; i < len(rows); i++ {
+		if bytes.Compare(rows[i-1].pk, rows[i].pk) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // flushLocked writes the current mem part of tbl to a new immutable part and
 // resets the mem part. Live counts are unchanged (rows only moved).
 func (s *mpartStore) flushLocked(tbl string) error {
+	t0 := time.Now()
 	mp := s.mem[tbl]
 	if mp == nil || len(mp.rows) == 0 {
 		return nil
 	}
-	rows := make([]*memRow, 0, len(mp.rows))
-	for _, r := range mp.rows {
-		rows = append(rows, r)
+	rows := mp.hint
+	if len(rows) != len(mp.rows) || !memRowsSorted(rows) {
+		rows = make([]*memRow, 0, len(mp.rows))
+		for _, r := range mp.rows {
+			rows = append(rows, r)
+		}
+		if !memRowsSorted(rows) {
+			sortMemRows(rows)
+		}
 	}
-	sortMemRows(rows)
+	sortDur := time.Since(t0)
+	t1 := time.Now()
 	s.nextID++
 	p, err := s.writePart(tbl, rows, s.nextID)
+	writeDur := time.Since(t1)
+	if d := time.Since(t0); d > 150*time.Millisecond {
+		log.Printf("FLUSH-SLOW: %v (sort %v write %v, %d rows)", d, sortDur, writeDur, len(rows))
+	}
 	if err != nil {
 		return err
 	}
@@ -1388,7 +1433,11 @@ func (p *mpart) loadCol(colIdx int) ([][]byte, [][]byte, error) {
 		return nil, nil, err
 	}
 	if colIdx < 0 || colIdx >= p.ncols {
-		return pks, nil, nil
+		// The part has no column data (e.g. a tombstone-only part produced by a
+		// range DELETE). Keep cells length-synced with pks so column walks see
+		// one (nil) cell per row; deleted rows are filtered by their tombstone
+		// bit before the nil cell is ever read.
+		return pks, make([][]byte, len(pks)), nil
 	}
 	if p.colsOnce == nil {
 		p.colsOnce = make([]sync.Once, p.ncols)
@@ -1670,17 +1719,38 @@ func (t *mpartTx) rowPutCells(table string, key []byte, cells [][]byte) error {
 	// A row that becomes live raises the table's count; overwriting a live row
 	// does not. The existence read goes through the overlay so repeated writes
 	// of one pk in a single tx are exact.
-	exists, err := t.rowExists(table, key)
-	if err != nil {
-		return err
+	return t.rowPutCellsCheckCount(table, key, cells, true)
+}
+
+// rowPutCellsNoCount is rowPutCells without the existence probe used to keep
+// the live-row count in sync. Callers that know every key already exists (the
+// columnar UPDATE batch: execUpdateColumnar only re-writes rows it scanned)
+// skip the bloom+granule lookup per row.
+func (t *mpartTx) rowPutCellsNoCount(table string, key []byte, cells [][]byte) error {
+	return t.rowPutCellsCheckCount(table, key, cells, false)
+}
+
+func (t *mpartTx) rowPutCellsCheckCount(table string, key []byte, cells [][]byte, check bool) error {
+	if check {
+		exists, err := t.rowExists(table, key)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			t.delta(table, 1)
+		}
 	}
-	if !exists {
-		t.delta(table, 1)
-	}
-	t.overlayPart(table).rows[string(key)] = &memRow{
+	mp := t.overlayPart(table)
+	r := &memRow{
 		pk:    append([]byte(nil), key...),
 		cells: cells,
 	}
+	if _, dup := mp.rows[string(key)]; !dup {
+		mp.hint = append(mp.hint, r)
+	} else {
+		mp.hint = nil
+	}
+	mp.rows[string(key)] = r
 	return nil
 }
 
@@ -1771,25 +1841,55 @@ func (t *mpartTx) rowExists(table string, key []byte) (bool, error) {
 func (t *mpartTx) lookup(table string, key []byte) (cells [][]byte, del, found bool, err error) {
 	if ov := t.overlay[table]; ov != nil {
 		if r, ok := ov.rows[string(key)]; ok {
-			return r.cells, r.del, true, nil
+			if r.del {
+				return nil, true, true, nil
+			}
+			if !hasEmptyCell(r.cells) {
+				return r.cells, false, true, nil
+			}
+			cells = append([][]byte(nil), r.cells...)
+			found = true
 		}
 	}
 	if t.cleared[table] {
+		if found {
+			return cells, false, true, nil
+		}
 		return nil, false, false, nil
 	}
 	parts, mem := t.committedView(table)
 	if mem != nil {
 		if r, ok := mem.rows[string(key)]; ok {
-			return r.cells, r.del, true, nil
+			if r.del {
+				if found {
+					return cells, false, true, nil
+				}
+				return nil, true, true, nil
+			}
+			if !found {
+				if !hasEmptyCell(r.cells) {
+					return r.cells, false, true, nil
+				}
+				cells = append([][]byte(nil), r.cells...)
+				found = true
+			} else {
+				fillEmptyCells(cells, r.cells)
+				if !hasEmptyCell(cells) {
+					return cells, false, true, nil
+				}
+			}
 		}
 	}
 	// Newest part first: a pk may live in several parts (an update rewrites a
-	// pk that already lives in an older part), and the newest one wins.
+	// pk that already lives in an older part), and the newest one wins. A
+	// partial newest version inherits its empty columns from the next part.
 	for i := len(parts) - 1; i >= 0; i-- {
 		p := parts[i]
 		if !p.bloom.mayContain(key) {
 			continue
 		}
+		var pr [][]byte
+		var pd bool
 		if g := p.granuleFor(key); g >= 0 {
 			// v4 part: decode only the granule that can hold the key.
 			pks, gerr := p.loadGranulePks(g)
@@ -1806,27 +1906,53 @@ func (t *mpartTx) lookup(table string, key []byte) (cells [][]byte, del, found b
 				if ferr != nil {
 					return nil, false, false, ferr
 				}
-				return full[gi], dels[gi], true, nil
+				pr, pd = full[gi], dels[gi]
+			} else {
+				continue
 			}
-			continue
-		}
-		if len(p.granules) > 0 {
+		} else if len(p.granules) > 0 {
 			// v4 part but the key lies outside the part's PK span (a bloom
 			// false positive): skip without decompressing.
 			continue
+		} else {
+			pks, full, lerr := p.loadRows()
+			if lerr != nil {
+				return nil, false, false, lerr
+			}
+			dels, derr := p.loadDels()
+			if derr != nil {
+				return nil, false, false, derr
+			}
+			gi := sort.Search(len(pks), func(i int) bool { return bytes.Compare(pks[i], key) >= 0 })
+			if gi < len(pks) && bytes.Equal(pks[gi], key) {
+				pr, pd = full[gi], dels[gi]
+			} else {
+				continue
+			}
 		}
-		pks, full, lerr := p.loadRows()
-		if lerr != nil {
-			return nil, false, false, lerr
+		if pd {
+			// A tombstone is the newest live-or-deleted version only when no
+			// newer live version exists.
+			if !found {
+				return nil, true, true, nil
+			}
+			continue
 		}
-		dels, derr := p.loadDels()
-		if derr != nil {
-			return nil, false, false, derr
+		if !found {
+			if !hasEmptyCell(pr) {
+				return pr, false, true, nil
+			}
+			cells = append([][]byte(nil), pr...)
+			found = true
+		} else {
+			fillEmptyCells(cells, pr)
+			if !hasEmptyCell(cells) {
+				return cells, false, true, nil
+			}
 		}
-		i := sort.Search(len(pks), func(i int) bool { return bytes.Compare(pks[i], key) >= 0 })
-		if i < len(pks) && bytes.Equal(pks[i], key) {
-			return full[i], dels[i], true, nil
-		}
+	}
+	if found {
+		return cells, false, true, nil
 	}
 	return nil, false, false, nil
 }
@@ -1856,17 +1982,17 @@ func (p *mpart) loadGranuleFull(g int) ([][][]byte, error) {
 
 // lookupCol resolves a single column cell of key through the merged view,
 // loading only that column's part file (point reads should not decompress the
-// whole part). Returns the cell (nil if absent or deleted).
+// whole part). Returns the cell (nil if absent or deleted). A partial newest
+// version whose cell for this column is empty inherits from the next version.
 func (t *mpartTx) lookupCol(table string, colIdx int, key []byte) ([]byte, error) {
 	if ov := t.overlay[table]; ov != nil {
 		if r, ok := ov.rows[string(key)]; ok {
 			if r.del {
 				return nil, nil
 			}
-			if colIdx >= 0 && colIdx < len(r.cells) {
+			if colIdx >= 0 && colIdx < len(r.cells) && len(r.cells[colIdx]) > 0 {
 				return r.cells[colIdx], nil
 			}
-			return nil, nil
 		}
 	}
 	if t.cleared[table] {
@@ -1878,10 +2004,9 @@ func (t *mpartTx) lookupCol(table string, colIdx int, key []byte) ([]byte, error
 			if r.del {
 				return nil, nil
 			}
-			if colIdx >= 0 && colIdx < len(r.cells) {
+			if colIdx >= 0 && colIdx < len(r.cells) && len(r.cells[colIdx]) > 0 {
 				return r.cells[colIdx], nil
 			}
-			return nil, nil
 		}
 	}
 	for i := len(parts) - 1; i >= 0; i-- {
@@ -1908,7 +2033,7 @@ func (t *mpartTx) lookupCol(table string, colIdx int, key []byte) ([]byte, error
 				if cerr != nil {
 					return nil, cerr
 				}
-				if gi < len(cells) {
+				if gi < len(cells) && len(cells[gi]) > 0 {
 					return cells[gi], nil
 				}
 			}
@@ -1932,7 +2057,9 @@ func (t *mpartTx) lookupCol(table string, colIdx int, key []byte) ([]byte, error
 			if dels[i] {
 				return nil, nil
 			}
-			return cells[i], nil
+			if i < len(cells) && len(cells[i]) > 0 {
+				return cells[i], nil
+			}
 		}
 	}
 	return nil, nil
@@ -2002,15 +2129,45 @@ func (t *mpartTx) commit() error {
 			cur = &memPart{rows: map[string]*memRow{}}
 			s.mem[tbl] = cur
 		}
+		t0 := time.Now()
+		foldedIntoEmpty := len(cur.rows) == 0
 		for k, r := range mp.rows {
+			// CH partial-merge: an overlay row may be partial (empty cells for
+			// untouched columns). When it overwrites a full mem row, inherit the
+			// missing columns from that row right here, so a flush can never
+			// persist a partial part whose full version was only in mem.
+			// Copy before filling: batch writers (the constant-range UPDATE)
+			// share one immutable cell slice across every row they rewrite,
+			// so stored cells must never be mutated in place.
+			if old, ok := cur.rows[k]; ok && old != r && !old.del {
+				merged := make([][]byte, len(r.cells))
+				copy(merged, r.cells)
+				fillEmptyCells(merged, old.cells)
+				r.cells = merged
+			}
 			cur.rows[k] = r
+		}
+		// Carry the writer's insertion-order hint only when this tx folded a
+		// duplicate-free batch into an empty mem part: then the hint is exactly
+		// the folded row set in ascending PK order (sorted scan output).
+		if foldedIntoEmpty && mp.hint != nil && len(mp.hint) == len(mp.rows) && memRowsSorted(mp.hint) {
+			cur.hint = mp.hint
+		} else {
+			cur.hint = nil
 		}
 		cur.gen++
 		s.lastWrite[tbl] = time.Now()
+		foldDur := time.Since(t0)
 		if len(cur.rows) >= mpartFlushThreshold {
+			t1 := time.Now()
 			if err := s.flushLocked(tbl); err != nil {
 				return err
 			}
+			if d := time.Since(t1); d > 150*time.Millisecond || foldDur > 150*time.Millisecond {
+				log.Printf("MPART-COMMIT-SLOW: fold %v flush %v (%d rows)", foldDur, d, len(cur.rows))
+			}
+		} else if foldDur > 150*time.Millisecond {
+			log.Printf("MPART-COMMIT-SLOW: fold %v (no flush)", foldDur)
 		}
 	}
 	for tbl, d := range t.deltas {
@@ -2084,6 +2241,12 @@ type mergeSrc struct {
 	step  int // +1 ascending, -1 descending
 	last  int // position at which iteration stops (exclusive)
 
+	// fromPart/denseCol mark a source loaded from an on-disk part whose
+	// requested column is in the dense fixed-width layout (no empty cells).
+	// They gate the covering-newest-source fast path below.
+	fromPart bool
+	denseCol bool
+
 	// vals/nulls hold a dense fixed-width numeric column (single-column view,
 	// parallel to pks) when the source was decoded from a dense part column.
 	vals  []int64
@@ -2140,6 +2303,52 @@ func sliceRange(pks [][]byte, plLower, plUpper []byte) (int, int) {
 		return 0, 0
 	}
 	return start, end
+}
+
+// coveringNewestSource returns the newest merge source when it provably holds
+// every key of the half-open range (plLower, plUpper both non-nil) and its
+// single-column view is dense, so reading it alone yields exactly the merged
+// result. Coverage is proven only for contiguous single-int64 PKs: sorted
+// unique keys with first == lower, last == upper-1 and count == upper-lower
+// leave no room for a gap an older part could fill. Any mem/overlay presence
+// disqualifies automatically — their prio always exceeds a part's seq.
+func coveringNewestSource(srcs []*mergeSrc, plLower, plUpper []byte) *mergeSrc {
+	if len(srcs) < 2 || plLower == nil || plUpper == nil ||
+		len(plLower) != 10 || len(plUpper) != 10 {
+		return nil
+	}
+	best := -1
+	for i, s := range srcs {
+		if best < 0 || s.prio > srcs[best].prio {
+			best = i
+		}
+	}
+	s := srcs[best]
+	if !s.fromPart {
+		// mem/overlay source: no format metadata, so density of the window is
+		// verified directly — every cell must be non-empty (a single empty
+		// cell would need inheritance from an older version).
+		if s.cells == nil {
+			return nil
+		}
+		for k := s.i; k < s.last; k++ {
+			if len(s.cells[k]) == 0 {
+				return nil
+			}
+		}
+	}
+	pks := s.pks
+	if len(pks) < 1 || len(pks[0]) != 10 {
+		return nil
+	}
+	first := binary.BigEndian.Uint64(pks[0][2:10])
+	last := binary.BigEndian.Uint64(pks[len(pks)-1][2:10])
+	lower := binary.BigEndian.Uint64(plLower[2:10])
+	upper := binary.BigEndian.Uint64(plUpper[2:10])
+	if first != lower || last != upper-1 || uint64(len(pks)) != upper-lower {
+		return nil
+	}
+	return s
 }
 
 func mapRows(mp *memPart) int {
@@ -2222,7 +2431,10 @@ func (t *mpartTx) walkMergedLocked(table string, colIdx int, full bool, rev bool
 		if lo >= hi {
 			return
 		}
-		s := &mergeSrc{pks: pks, cells: cells, fulls: fulls, dels: dels, prio: p.seq}
+		s := &mergeSrc{pks: pks, cells: cells, fulls: fulls, dels: dels, prio: p.seq,
+			fromPart: true,
+			denseCol: colIdx >= 0 && !full && colIdx < len(p.colFmts) && p.colFmts[colIdx] != colFmtLegacy,
+		}
 		if rev {
 			s.i = hi - 1
 			s.last = lo - 1
@@ -2283,6 +2495,18 @@ func (t *mpartTx) walkMergedLocked(table string, colIdx int, full bool, rev bool
 	if len(h.h) == 1 {
 		return walkSource(h.h[0], full, fn)
 	}
+	// Covering-newest fast path: after a range UPDATE every rewritten key of
+	// [plLower, plUpper) lives in the newest flushed part (the batch rewrote
+	// exactly the live rows it scanned), so within that window every older
+	// part is fully shadowed. When the newest source provably holds *every*
+	// key of the range (contiguous int64 PKs) and its column is dense (no
+	// empty cells to inherit), walking it alone is exact — the k-way heap and
+	// the older parts' column loads are pure overhead.
+	if !rev {
+		if s := coveringNewestSource(h.h, plLower, plUpper); s != nil {
+			return walkSource(s, full, fn)
+		}
+	}
 	if sortDisjointSources(h.h, rev) {
 		for _, s := range h.h {
 			if err := walkSource(s, full, fn); err != nil {
@@ -2300,26 +2524,91 @@ func (t *mpartTx) walkMergedLocked(table string, colIdx int, full bool, rev bool
 		if !s.done() {
 			heap.Push(&h, s)
 		}
-		// Advance every other source whose head pk is the same: with the heap's
-		// (pk, prio desc) order these are older versions shadowed by s.
-		for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) {
-			top := h.h[0]
-			top.i += top.step
-			if top.done() {
-				heap.Pop(&h)
-			} else {
-				heap.Fix(&h, 0)
-			}
-		}
-		var cell []byte
-		var cells [][]byte
 		if full {
-			cells = s.fulls[i]
-		} else if colIdx >= 0 {
-			cell = s.cells[i]
-		}
-		if err := fn(pk, cell, cells, s.dels[i]); err != nil {
-			return err
+			cells := s.fulls[i]
+			if !s.dels[i] && hasEmptyCell(cells) {
+				// CH partial-merge: the newest version is a partial row (its
+				// untouched columns are empty). Copy it and inherit each missing
+				// column from the older shadowed versions (at the heap head,
+				// same pk, lower prio), advancing them as we go.
+				merged := make([][]byte, len(cells))
+				copy(merged, cells)
+				for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) && hasEmptyCell(merged) {
+					top := h.h[0]
+					if !top.dels[top.i] {
+						fillEmptyCells(merged, top.fulls[top.i])
+					}
+					top.i += top.step
+					if top.done() {
+						heap.Pop(&h)
+					} else {
+						heap.Fix(&h, 0)
+					}
+				}
+				cells = merged
+			}
+			// Advance every other source whose head pk is the same: with the
+			// heap's (pk, prio desc) order these are older versions shadowed by
+			// s. (Reached either after the column-wise inherit loop consumed
+			// them, or directly when s is a full row / tombstone.)
+			for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) {
+				top := h.h[0]
+				top.i += top.step
+				if top.done() {
+					heap.Pop(&h)
+				} else {
+					heap.Fix(&h, 0)
+				}
+			}
+			if err := fn(pk, nil, cells, s.dels[i]); err != nil {
+				return err
+			}
+		} else if colIdx >= 0 && s.cells != nil {
+			cell := s.cells[i]
+			if !s.dels[i] && len(cell) == 0 {
+				// Column-wise inheritance for a single-column view: the newest
+				// version lacks this column, so take it from the next non-empty
+				// older version.
+				for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) {
+					top := h.h[0]
+					if len(cell) == 0 && !top.dels[top.i] {
+						cell = top.cells[top.i]
+					}
+					top.i += top.step
+					if top.done() {
+						heap.Pop(&h)
+					} else {
+						heap.Fix(&h, 0)
+					}
+				}
+			} else {
+				for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) {
+					top := h.h[0]
+					top.i += top.step
+					if top.done() {
+						heap.Pop(&h)
+					} else {
+						heap.Fix(&h, 0)
+					}
+				}
+			}
+			if err := fn(pk, cell, nil, s.dels[i]); err != nil {
+				return err
+			}
+		} else {
+			// PK-only walk: no cell data; newest wins outright.
+			for h.Len() > 0 && bytes.Equal(h.h[0].pks[h.h[0].i], pk) {
+				top := h.h[0]
+				top.i += top.step
+				if top.done() {
+					heap.Pop(&h)
+				} else {
+					heap.Fix(&h, 0)
+				}
+			}
+			if err := fn(pk, nil, nil, s.dels[i]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -2389,11 +2678,18 @@ func (mp *memPart) ensureCached() {
 	if mp.gen == mp.cacheGen && mp.cacheRows != nil {
 		return
 	}
-	rs := make([]*memRow, 0, len(mp.rows))
-	for _, r := range mp.rows {
-		rs = append(rs, r)
+	var rs []*memRow
+	if mp.hint != nil && len(mp.hint) == len(mp.rows) && memRowsSorted(mp.hint) {
+		// The writer guaranteed ascending PK order (sorted UPDATE scan); skip
+		// both the map gather and the sort.
+		rs = mp.hint
+	} else {
+		rs = make([]*memRow, 0, len(mp.rows))
+		for _, r := range mp.rows {
+			rs = append(rs, r)
+		}
+		sort.Slice(rs, func(i, j int) bool { return bytes.Compare(rs[i].pk, rs[j].pk) < 0 })
 	}
-	sort.Slice(rs, func(i, j int) bool { return bytes.Compare(rs[i].pk, rs[j].pk) < 0 })
 	pks := make([][]byte, len(rs))
 	dels := make([]bool, len(rs))
 	for i, r := range rs {
@@ -2477,6 +2773,32 @@ func walkSource(s *mergeSrc, full bool, fn func(pk []byte, cell []byte, cells []
 		}
 	}
 	return nil
+}
+
+// hasEmptyCell reports whether the row's cell slice contains an empty (len-0)
+// blob. A len-0 cell is the CH "column not touched in this version" marker
+// (distinct from NULL, which is a [type][null=1] variant, 2+ bytes): partial
+// UPDATE rows write only their changed columns and leave the rest empty so the
+// column-wise merge below inherits them from the previous version.
+func hasEmptyCell(cells [][]byte) bool {
+	for _, c := range cells {
+		if len(c) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// fillEmptyCells overwrites the empty (len-0) slots of dst with the
+// corresponding non-empty cells of src (column-wise inheritance). src may be a
+// shorter row (a tombstone-only part has no column cells), so reads are bounds
+// checked; tombstone (del) rows carry no cells and contribute nothing.
+func fillEmptyCells(dst, src [][]byte) {
+	for c := range dst {
+		if len(dst[c]) == 0 && c < len(src) && len(src[c]) > 0 {
+			dst[c] = src[c]
+		}
+	}
 }
 
 // sortDisjointSources sorts the sources by their first in-range PK (desc if

@@ -1327,6 +1327,17 @@ func pkKeyFromWhere(schema *sqlx.TableSchema, where sqlx.Expr) (string, bool) {
 	return storage.EncodePK(pk), true
 }
 
+// schemaColIndex returns the column index of name within the schema (by
+// position in the table's column list).
+func schemaColIndex(schema *sqlx.TableSchema, name string) int {
+	for i, c := range schema.Columns {
+		if c.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
 // --- union engine (scatter/gather SELECT) ---
 
 type unionEngine struct {
@@ -1347,6 +1358,29 @@ func (u *unionEngine) Scan(name string) ([]sqlx.Row, error) {
 	}
 	return u.rows, nil
 }
+func (u *unionEngine) Get(name string, pk []sqlx.Value) (sqlx.Row, error) {
+	if name != u.spec.Schema.Name {
+		return nil, notFound(name)
+	}
+	pkIdx := make([]int, len(u.spec.Schema.PK))
+	for i, p := range u.spec.Schema.PK {
+		pkIdx[i] = schemaColIndex(u.spec.Schema, p)
+	}
+	for _, r := range u.rows {
+		ok := true
+		for i, pi := range pkIdx {
+			c, err := sqlx.Compare(r[pi], pk[i])
+			if err != nil || c != 0 {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return r, nil
+		}
+	}
+	return nil, nil
+}
 func (u *unionEngine) CreateTable(*sqlx.TableSchema) error { return errors.New("read-only") }
 func (u *unionEngine) DropTable(string) error              { return errors.New("read-only") }
 func (u *unionEngine) Insert(string, map[string]sqlx.Value) error {
@@ -1364,6 +1398,7 @@ type emptyEngine struct{}
 
 func (emptyEngine) GetSchema(name string) (*sqlx.TableSchema, error) { return nil, notFound(name) }
 func (emptyEngine) Scan(name string) ([]sqlx.Row, error)             { return nil, notFound(name) }
+func (emptyEngine) Get(name string, pk []sqlx.Value) (sqlx.Row, error) { return nil, notFound(name) }
 func (emptyEngine) CreateTable(*sqlx.TableSchema) error              { return errors.New("read-only") }
 func (emptyEngine) DropTable(string) error                           { return errors.New("read-only") }
 func (emptyEngine) Insert(string, map[string]sqlx.Value) error       { return errors.New("read-only") }

@@ -331,14 +331,27 @@ func (t *cstoreTx) rowPut(table string, key []byte, val []byte) error {
 }
 
 func (t *cstoreTx) rowPutCells(table string, key []byte, cells [][]byte) error {
+	return t.rowPutCellsCheckCount(table, key, cells, true)
+}
+
+// rowPutCellsNoCount skips the existence probe used to keep the live-row count
+// in sync; callers that know every key exists (the columnar UPDATE batch) use
+// it to avoid one point read per row.
+func (t *cstoreTx) rowPutCellsNoCount(table string, key []byte, cells [][]byte) error {
+	return t.rowPutCellsCheckCount(table, key, cells, false)
+}
+
+func (t *cstoreTx) rowPutCellsCheckCount(table string, key []byte, cells [][]byte, check bool) error {
 	n := len(cells)
 	// A row that becomes live raises the table's live count; an overwrite of
 	// an already-live row does not. The existence read goes through the
 	// overlay so repeated writes of the same pk in one tx are exact.
-	if was, err := t.get(cstoreRowKey(table, key)); err != nil {
-		return err
-	} else if len(was) == 0 {
-		t.count(table, 1)
+	if check {
+		if was, err := t.get(cstoreRowKey(table, key)); err != nil {
+			return err
+		} else if len(was) == 0 {
+			t.count(table, 1)
+		}
 	}
 	var cnt [8]byte
 	binary.BigEndian.PutUint64(cnt[:], uint64(n))
