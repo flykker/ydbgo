@@ -2344,8 +2344,11 @@ type mergeSrc struct {
 
 	// vals/nulls hold a dense fixed-width numeric column (single-column view,
 	// parallel to pks) when the source was decoded from a dense part column.
+	// miss marks rows whose cell for this column is ABSENT (partial row) —
+	// distinct from SQL null: missing cells inherit from older versions.
 	vals  []int64
 	nulls []uint64
+	miss  []uint64
 }
 
 func (s *mergeSrc) done() bool { return s.i == s.last }

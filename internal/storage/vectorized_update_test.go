@@ -131,3 +131,40 @@ func TestVectorizedConstRangeUpdateStringPK(t *testing.T) {
 		t.Fatalf("g(m) = %d, want 13", rr.Rows[0][0].Int)
 	}
 }
+
+// TestVectorizedConstRangeUpdateAggregateInMem: a constant rewrite whose rows
+// are still unflushed (below the mem threshold) leaves partial rows in the
+// mem part; numeric aggregates over that window must inherit untouched
+// columns from older versions, never read fabricated zeros.
+func TestVectorizedConstRangeUpdateAggregateInMem(t *testing.T) {
+	e, err := storage.Open(t.TempDir() + "/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	ex := sql.NewExecutor(e)
+	mustExec(t, ex, "CREATE TABLE t (id int64 primary key, v string, g int64) ENGINE=CSTORE2")
+	const n = 500 // far below mpartFlushThreshold: everything stays in mem
+	mustExec(t, ex, "INSERT INTO t (id, v, g) VALUES "+bulkValues(n))
+	mustExec(t, ex, "UPDATE t SET g = 5 WHERE id >= 100 AND id < 200")
+	// SUM over the rewritten window reads the PK column of PARTIAL rows (the
+	// rewrite leaves id/v cells empty): inheritance must yield real ids, not
+	// fabricated zeros.
+	r := execOK(t, ex, "SELECT SUM(id) AS s FROM t WHERE id >= 100 AND id < 200")
+	if r.Rows[0][0].Int != 14950 {
+		t.Fatalf("sum(id) in-mem = %d, want 14950", r.Rows[0][0].Int)
+	}
+	// SUM over a window mixing partial and untouched rows.
+	r = execOK(t, ex, "SELECT SUM(g) AS s FROM t WHERE id < 300")
+	want := int64(0)
+	for i := 0; i < 300; i++ {
+		if i >= 100 && i < 200 {
+			want += 5
+		} else {
+			want += int64(i)
+		}
+	}
+	if r.Rows[0][0].Int != want {
+		t.Fatalf("sum(g) mixed = %d, want %d", r.Rows[0][0].Int, want)
+	}
+}

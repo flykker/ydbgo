@@ -570,7 +570,7 @@ func (t *mpartTx) fastNumericParts(table string, parts []*mpart, mem *memPart, c
 		if r.del {
 			continue
 		}
-		if colIdx < len(r.cells) {
+		if colIdx < len(r.cells) && len(r.cells[colIdx]) > 0 {
 			val, null, ok := numericAtCell(r.cells[colIdx], typ)
 			if !ok {
 				vv := makeReader(r.cells[colIdx]).Variant()
@@ -581,6 +581,12 @@ func (t *mpartTx) fastNumericParts(table string, parts []*mpart, mem *memPart, c
 				}
 			}
 			if err := fn(nil, val, null, false); err != nil {
+				return false
+			}
+		} else {
+			// Partial row: no older version is reachable in this concat path,
+			// so the missing column reads as SQL null (never as zero).
+			if err := fn(nil, 0, true, false); err != nil {
 				return false
 			}
 		}
@@ -712,12 +718,18 @@ func (t *mpartTx) walkMergedNumericLocked(table string, colIdx int, typ sqlType,
 			}
 		}
 		if !ok {
-			// Generic fallback: cell is not shaped as a numeric type.
-			vv := makeReader(s.cells[i]).Variant()
-			if vv.null {
+			if s.miss != nil && s.miss[i>>6]&(1<<(i&63)) != 0 || s.cells == nil || i >= len(s.cells) {
+				// Still missing after inheritance (no older version carries
+				// this column): read as SQL null, never as a fabricated zero.
 				null = true
 			} else {
-				val = vv.i
+				// Generic fallback: cell is not shaped as a numeric type.
+				vv := makeReader(s.cells[i]).Variant()
+				if vv.null {
+					null = true
+				} else {
+					val = vv.i
+				}
 			}
 		}
 		if err := fn(pk, val, null, s.dels[i]); err != nil {
@@ -729,8 +741,12 @@ func (t *mpartTx) walkMergedNumericLocked(table string, colIdx int, typ sqlType,
 
 // numericAt reads the decoded int64 value of source s at position i. Dense
 // sources read the pre-decoded array; legacy sources decode the cell. ok=false
-// signals a cell not shaped as the expected numeric type.
+// signals a cell not shaped as the expected numeric type, or a missing cell
+// (partial row) — callers must inherit the value from an older version.
 func numericAt(s *mergeSrc, i int, typ sqlType) (val int64, null bool, ok bool) {
+	if s.miss != nil && s.miss[i>>6]&(1<<(i&63)) != 0 {
+		return 0, false, false
+	}
 	if s.vals != nil {
 		val = s.vals[i]
 		null = s.nulls[i>>6]&(1<<(i&63)) != 0
@@ -782,11 +798,19 @@ func walkSourceNumeric(s *mergeSrc, typ sqlType, fn func(pk []byte, val int64, n
 	for i := s.i; i != s.last; i += s.step {
 		val, null, ok := numericAt(s, i, typ)
 		if !ok {
-			vv := makeReader(s.cells[i]).Variant()
-			if vv.null {
+			if s.miss != nil && s.miss[i>>6]&(1<<(i&63)) != 0 {
+				// Single-source walk: no older version to inherit from, so a
+				// missing column reads as SQL null (never as zero).
 				null = true
+			} else if len(s.cells) > i {
+				vv := makeReader(s.cells[i]).Variant()
+				if vv.null {
+					null = true
+				} else {
+					val = vv.i
+				}
 			} else {
-				val = vv.i
+				null = true
 			}
 		}
 		if err := fn(s.pks[i], val, null, s.dels[i]); err != nil {
@@ -816,10 +840,11 @@ func addMemNumericSource(h *mergeHeap, mp *memPart, colIdx int, typ sqlType, plL
 	dels := make([]bool, len(rs))
 	vals := make([]int64, len(rs))
 	nulls := make([]uint64, (len(rs)+7)/8)
+	miss := make([]uint64, (len(rs)+7)/8)
 	for i, r := range rs {
 		pks[i] = r.pk
 		dels[i] = r.del
-		if colIdx < len(r.cells) {
+		if colIdx < len(r.cells) && len(r.cells[colIdx]) > 0 {
 			val, null, ok := numericAtCell(r.cells[colIdx], typ)
 			if !ok {
 				vv := makeReader(r.cells[colIdx]).Variant()
@@ -833,9 +858,14 @@ func addMemNumericSource(h *mergeHeap, mp *memPart, colIdx int, typ sqlType, plL
 			if null {
 				nulls[i>>6] |= 1 << (i & 63)
 			}
+		} else {
+			// Partial row: the column was not touched by this version. Mark
+			// it missing — never fabricate a value — so the merge inherits
+			// the column from the next-older version of the same key.
+			miss[i>>6] |= 1 << (i & 63)
 		}
 	}
-	s := &mergeSrc{pks: pks, vals: vals, nulls: nulls, dels: dels, prio: prioMem}
+	s := &mergeSrc{pks: pks, vals: vals, nulls: nulls, miss: miss, dels: dels, prio: prioMem}
 	s.i = 0
 	s.last = len(rs)
 	s.step = 1
@@ -859,10 +889,11 @@ func addRowNumericSource(h *mergeHeap, rows map[string]*memRow, colIdx int, typ 
 	dels := make([]bool, len(rs))
 	vals := make([]int64, len(rs))
 	nulls := make([]uint64, (len(rs)+7)/8)
+	miss := make([]uint64, (len(rs)+7)/8)
 	for i, r := range rs {
 		pks[i] = r.pk
 		dels[i] = r.del
-		if colIdx < len(r.cells) {
+		if colIdx < len(r.cells) && len(r.cells[colIdx]) > 0 {
 			val, null, ok := numericAtCell(r.cells[colIdx], typ)
 			if !ok {
 				vv := makeReader(r.cells[colIdx]).Variant()
@@ -876,9 +907,13 @@ func addRowNumericSource(h *mergeHeap, rows map[string]*memRow, colIdx int, typ 
 			if null {
 				nulls[i>>6] |= 1 << (i & 63)
 			}
+		} else {
+			// Partial row: mark the column missing so the merge inherits it
+			// from an older version instead of reading a fabricated zero.
+			miss[i>>6] |= 1 << (i & 63)
 		}
 	}
-	s := &mergeSrc{pks: pks, vals: vals, nulls: nulls, dels: dels, prio: prio}
+	s := &mergeSrc{pks: pks, vals: vals, nulls: nulls, miss: miss, dels: dels, prio: prio}
 	s.i = 0
 	s.last = len(rs)
 	s.step = 1
